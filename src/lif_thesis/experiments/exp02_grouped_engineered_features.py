@@ -1,50 +1,31 @@
 """
 Experiment 02: Grouped split + engineered scattering summary features.
 
-Purpose:
-Test whether adding engineered scattering-derived scalar features improves
-multiclass bacterial identification.
-
-Compared with Experiment 01:
-- Same fluorescence threshold: peak fluorescence > 2000 a.u.
-- Same grouped raw-file split
-- Same Random Forest tuning structure
-- Same paper-style feature sets
-
-New in Experiment 02:
-- Adds optional scalar features:
-    size
-    time_asymmetry
-
-Primary question:
-How much do engineered scattering features improve balanced accuracy?
+Tests whether adding size and time_asymmetry improves grouped RF performance.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 import json
-import joblib
 from itertools import product
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    classification_report,
-    confusion_matrix,
-    f1_score,
-)
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 from sklearn.preprocessing import LabelEncoder
 
 from lif_thesis.data.splits import make_group_split
+from lif_thesis.models.checkpoint import save_model_bundle
+from lif_thesis.models.updated_rf import (
+    evaluate_classifier,
+    make_updated_rf,
+)
 
 
 DATA_PATH = Path("data/processed/bacterial_samples.parquet")
 OUTPUT_DIR = Path("results/exp02_grouped_engineered_features")
+MODEL_ID = "exp02_grouped_engineered_rf_v1"
 
 
 def to_array(x) -> np.ndarray:
@@ -56,8 +37,7 @@ def to_array(x) -> np.ndarray:
 
 
 def peak_fluorescence(spectrum) -> float:
-    arr = to_array(spectrum)
-    return float(np.max(arr))
+    return float(np.max(to_array(spectrum)))
 
 
 def stack_vector_column(df: pd.DataFrame, col: str) -> np.ndarray:
@@ -69,17 +49,7 @@ def crop_pad_scattering(
     n_acquisitions: int = 60,
     n_angles: int = 24,
 ) -> np.ndarray:
-    """
-    Paper-style scattering preprocessing.
-
-    - crop to 30 us
-    - 60 acquisitions
-    - 24 angular channels
-    - zero-pad shorter signals
-    - normalize to [0, 1]
-    """
     target_len = n_acquisitions * n_angles
-
     arr = to_array(scattering).astype(float).flatten()
 
     if len(arr) >= target_len:
@@ -88,7 +58,6 @@ def crop_pad_scattering(
         arr = np.pad(arr, (0, target_len - len(arr)), mode="constant")
 
     max_val = arr.max()
-
     if max_val > 0:
         arr = arr / max_val
 
@@ -100,26 +69,11 @@ def build_feature_matrix(
     feature_set: str,
     scalar_cols: list[str] | None = None,
 ) -> tuple[np.ndarray, list[str]]:
-    """
-    Build feature matrix.
-
-    Supports feature names:
-    - spectra
-    - lifetime
-    - scattering
-    - scalar
-
-    Example feature sets:
-    - spectra+lifetime
-    - spectra+lifetime+scalar
-    - spectra+lifetime+scattering+scalar
-    """
     if scalar_cols is None:
         scalar_cols = ["size", "time_asymmetry"]
 
     parts = []
     names = []
-
     tokens = feature_set.split("+")
 
     if "spectra" in tokens:
@@ -133,9 +87,7 @@ def build_feature_matrix(
         names.extend([f"lifetime_{i}" for i in range(X_life.shape[1])])
 
     if "scattering" in tokens:
-        X_scat = np.stack(
-            df["scattering_image"].apply(crop_pad_scattering).values
-        )
+        X_scat = np.stack(df["scattering_image"].apply(crop_pad_scattering).values)
         parts.append(X_scat)
         names.extend([f"scattering_{i}" for i in range(X_scat.shape[1])])
 
@@ -145,20 +97,13 @@ def build_feature_matrix(
             raise ValueError(f"Missing scalar columns: {missing_scalars}")
 
         X_scalar = df[scalar_cols].copy()
-
         for col in scalar_cols:
             X_scalar[col] = pd.to_numeric(X_scalar[col], errors="coerce")
 
         if X_scalar.isna().any().any():
-            missing_summary = X_scalar.isna().sum()
-            raise ValueError(
-                "Missing scalar values detected:\n"
-                f"{missing_summary[missing_summary > 0]}"
-            )
+            raise ValueError(f"Missing scalar values:\n{X_scalar.isna().sum()}")
 
-        X_scalar = X_scalar.to_numpy(dtype=float)
-
-        parts.append(X_scalar)
+        parts.append(X_scalar.to_numpy(dtype=float))
         names.extend(scalar_cols)
 
     if not parts:
@@ -172,47 +117,13 @@ def build_feature_matrix(
     return X, names
 
 
-def evaluate_model(
-    model: RandomForestClassifier,
-    X: np.ndarray,
-    y: np.ndarray,
-    label_encoder: LabelEncoder,
-    split_name: str,
-) -> dict:
-    y_pred = model.predict(X)
-
-    labels = np.arange(len(label_encoder.classes_))
-    target_names = label_encoder.classes_.astype(str)
-
-    return {
-        "split": split_name,
-        "accuracy": accuracy_score(y, y_pred),
-        "balanced_accuracy": balanced_accuracy_score(y, y_pred),
-        "macro_f1": f1_score(y, y_pred, average="macro", zero_division=0),
-        "weighted_f1": f1_score(y, y_pred, average="weighted", zero_division=0),
-        "confusion_matrix": confusion_matrix(
-            y,
-            y_pred,
-            labels=labels,
-        ).tolist(),
-        "classification_report": classification_report(
-            y,
-            y_pred,
-            labels=labels,
-            target_names=target_names,
-            output_dict=True,
-            zero_division=0,
-        ),
-    }
-
-
-def main():
+def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     label_col = "species"
     group_col = "raw_file"
     scalar_cols = ["size", "time_asymmetry"]
-    fluorescence_threshold = 2000
+    fluorescence_threshold = 2000.0
     random_state = 42
 
     print("Loading data...")
@@ -237,10 +148,9 @@ def main():
         & df["spectrometer"].notna()
         & df["lifetime"].notna()
         & df["scattering_image"].notna()
+        & df["size"].notna()
+        & df["time_asymmetry"].notna()
     ].reset_index(drop=True)
-
-    for col in scalar_cols:
-        df = df[df[col].notna()].reset_index(drop=True)
 
     print(f"Particles before fluorescence threshold: {len(df)}")
 
@@ -248,11 +158,8 @@ def main():
     df = df[df["peak_fluorescence"] > fluorescence_threshold].reset_index(drop=True)
 
     print(f"Particles after fluorescence > {fluorescence_threshold}: {len(df)}")
-    print("\nClass counts after filtering:")
+    print("\nClass counts:")
     print(df[label_col].value_counts())
-
-    print("\nRaw files per class after filtering:")
-    print(df.groupby(label_col)[group_col].nunique())
 
     label_encoder = LabelEncoder()
     y = label_encoder.fit_transform(df[label_col].astype(str))
@@ -270,7 +177,6 @@ def main():
     )
 
     feature_sets = [
-        # Paper-style features without engineered scalars
         "spectra",
         "lifetime",
         "scattering",
@@ -278,8 +184,6 @@ def main():
         "spectra+scattering",
         "lifetime+scattering",
         "spectra+lifetime+scattering",
-
-        # Same feature sets with engineered scalars
         "spectra+scalar",
         "lifetime+scalar",
         "scattering+scalar",
@@ -299,8 +203,6 @@ def main():
     best_feature_names = None
     best_X = None
 
-    print("\nStarting RF tuning with engineered feature comparisons...")
-
     for feature_set, n_estimators, max_depth in product(
         feature_sets,
         n_estimators_grid,
@@ -317,148 +219,167 @@ def main():
             scalar_cols=scalar_cols,
         )
 
-        X_train = X[train_idx]
-        y_train = y[train_idx]
-
-        X_val = X[val_idx]
-        y_val = y[val_idx]
-
-        model = RandomForestClassifier(
+        model = make_updated_rf(
             n_estimators=n_estimators,
             max_depth=max_depth,
-            class_weight="balanced",
-            max_features="sqrt",
-            n_jobs=-1,
             random_state=random_state,
         )
 
-        model.fit(X_train, y_train)
+        model.fit(X[train_idx], y[train_idx])
 
-        y_val_pred = model.predict(X_val)
-
-        val_accuracy = accuracy_score(y_val, y_val_pred)
-        val_balanced_accuracy = balanced_accuracy_score(y_val, y_val_pred)
-        val_macro_f1 = f1_score(
-            y_val,
-            y_val_pred,
-            average="macro",
-            zero_division=0,
-        )
+        y_val_pred = model.predict(X[val_idx])
 
         result = {
             "feature_set": feature_set,
             "uses_engineered_scalars": "scalar" in feature_set.split("+"),
             "n_estimators": n_estimators,
             "max_depth": max_depth,
-            "val_accuracy": val_accuracy,
-            "val_balanced_accuracy": val_balanced_accuracy,
-            "val_macro_f1": val_macro_f1,
+            "val_accuracy": accuracy_score(y[val_idx], y_val_pred),
+            "val_balanced_accuracy": balanced_accuracy_score(y[val_idx], y_val_pred),
+            "val_macro_f1": f1_score(
+                y[val_idx],
+                y_val_pred,
+                average="macro",
+                zero_division=0,
+            ),
             "n_features": X.shape[1],
         }
 
         tuning_results.append(result)
 
         print(
-            f"Val accuracy={val_accuracy:.4f} | "
-            f"Val balanced accuracy={val_balanced_accuracy:.4f} | "
-            f"Val macro F1={val_macro_f1:.4f}"
+            f"Val balanced accuracy={result['val_balanced_accuracy']:.4f} | "
+            f"Val macro F1={result['val_macro_f1']:.4f}"
         )
 
-        selection_score = val_balanced_accuracy
-
-        if selection_score > best_score:
-            best_score = selection_score
+        if result["val_balanced_accuracy"] > best_score:
+            best_score = result["val_balanced_accuracy"]
             best_model = model
             best_config = result
             best_feature_names = feature_names
             best_X = X
 
+    if (
+        best_model is None
+        or best_config is None
+        or best_feature_names is None
+        or best_X is None
+    ):
+        raise RuntimeError("No model selected.")
+
     tuning_df = pd.DataFrame(tuning_results)
     tuning_df.to_csv(OUTPUT_DIR / "tuning_results.csv", index=False)
 
-    # Summarize best result per feature set
     feature_summary = (
         tuning_df.sort_values("val_balanced_accuracy", ascending=False)
         .groupby("feature_set", as_index=False)
         .first()
         .sort_values("val_balanced_accuracy", ascending=False)
     )
-
     feature_summary.to_csv(OUTPUT_DIR / "feature_set_summary.csv", index=False)
-
-    print("\nBest result per feature set:")
-    print(feature_summary[[
-        "feature_set",
-        "uses_engineered_scalars",
-        "val_balanced_accuracy",
-        "val_macro_f1",
-        "val_accuracy",
-        "n_estimators",
-        "max_depth",
-    ]])
-
-    print("\nBest overall configuration:")
-    print(best_config)
-
-    X_train = best_X[train_idx]
-    X_val = best_X[val_idx]
-    X_test = best_X[test_idx]
-
-    y_train = y[train_idx]
-    y_val = y[val_idx]
-    y_test = y[test_idx]
 
     metrics = {
         "experiment": {
             "name": "exp02_grouped_engineered_features",
+            "model_id": MODEL_ID,
             "label_col": label_col,
             "group_col": group_col,
             "fluorescence_threshold": fluorescence_threshold,
             "split_protocol": "grouped_raw_file_60_train_20_val_20_test",
             "scalar_features": scalar_cols,
-            "note": (
-                "Compares paper-style feature sets with and without engineered "
-                "scattering summary features."
-            ),
+            "note": "Compares paper-style feature sets with and without engineered scattering summary features.",
         },
         "best_config": best_config,
-        "train": evaluate_model(
+        "train": evaluate_classifier(
             best_model,
-            X_train,
-            y_train,
+            best_X[train_idx],
+            y[train_idx],
             label_encoder,
             "train",
         ),
-        "val_tuning": evaluate_model(
+        "val_tuning": evaluate_classifier(
             best_model,
-            X_val,
-            y_val,
+            best_X[val_idx],
+            y[val_idx],
             label_encoder,
             "val_tuning",
         ),
-        "test_final": evaluate_model(
+        "test_final": evaluate_classifier(
             best_model,
-            X_test,
-            y_test,
+            best_X[test_idx],
+            y[test_idx],
             label_encoder,
             "test_final",
         ),
     }
 
-    with open(OUTPUT_DIR / "metrics.json", "w") as f:
+    label_mapping = {
+        int(i): str(label)
+        for i, label in enumerate(label_encoder.classes_)
+    }
+
+    checkpoint = {
+        "model_id": MODEL_ID,
+        "model_type": "sklearn_random_forest",
+        "framework": "sklearn",
+        "model_module": "lif_thesis.models.updated_rf",
+        "class_names": label_encoder.classes_.astype(str).tolist(),
+        "feature_set": best_config["feature_set"],
+        "feature_names": best_feature_names,
+        "best_config": best_config,
+        "fluorescence_threshold": fluorescence_threshold,
+    }
+
+    metadata = {
+        "model_id": MODEL_ID,
+        "display_name": "Exp02 Grouped Engineered RF",
+        "model_type": "sklearn_random_forest",
+        "framework": "sklearn",
+        "model_file": "model.joblib",
+        "labels_file": "labels.json",
+        "label_encoder_file": "label_encoder.joblib",
+        "feature_names_file": "feature_names.json",
+        "preprocessing": {
+            "fluorescence_threshold": fluorescence_threshold,
+            "scattering_target_acquisitions": 60,
+            "n_scattering_angles": 24,
+            "scattering_normalize": True,
+            "feature_set": best_config["feature_set"],
+            "scalar_features": scalar_cols,
+        },
+        "performance": {
+            "test_accuracy": metrics["test_final"]["accuracy"],
+            "test_balanced_accuracy": metrics["test_final"]["balanced_accuracy"],
+            "test_macro_f1": metrics["test_final"]["macro_f1"],
+        },
+    }
+
+    save_model_bundle(
+        model=best_model,
+        model_id=MODEL_ID,
+        deploy_dir=Path("models/trained"),
+        checkpoint=checkpoint,
+        metadata=metadata,
+        label_mapping=label_mapping,
+        label_encoder=label_encoder,
+        framework="sklearn",
+        extra_artifacts={
+            "feature_names.json": best_feature_names,
+        },
+    )
+
+    with open(OUTPUT_DIR / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=4)
 
-    with open(OUTPUT_DIR / "feature_names.json", "w") as f:
+    with open(OUTPUT_DIR / "feature_names.json", "w", encoding="utf-8") as f:
         json.dump(best_feature_names, f, indent=4)
-
-    joblib.dump(best_model, OUTPUT_DIR / "engineered_features_rf.joblib")
-    joblib.dump(label_encoder, OUTPUT_DIR / "label_encoder.joblib")
 
     np.save(OUTPUT_DIR / "train_idx.npy", train_idx)
     np.save(OUTPUT_DIR / "val_tuning_idx.npy", val_idx)
     np.save(OUTPUT_DIR / "test_final_idx.npy", test_idx)
 
     print(f"\nSaved outputs to: {OUTPUT_DIR}")
+    print(f"Saved model bundle to: models/trained/{MODEL_ID}")
 
     print("\nFinal test performance:")
     print(

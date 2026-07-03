@@ -78,8 +78,8 @@ class ParticleRecordSummary:
 
 def decode_raw_file(path: str | Path) -> pd.DataFrame:
     """
-    Decode one live Rapid-E .raw file into the same particle-level
-    dataframe structure used during model training.
+    Decode one Rapid-E RAW file into the particle dataframe expected by the
+    preprocessing and prediction pipeline.
     """
     path = Path(path)
 
@@ -91,40 +91,24 @@ def decode_raw_file(path: str | Path) -> pd.DataFrame:
 
     df = parsed.particle_data.copy()
 
+    # File metadata
     df["raw_file"] = path.name
     df["raw_path"] = str(path)
     df["filename"] = path.name
 
-    return df
+    # Standardize column names expected by preprocessing
+    column_aliases = {
+        "spectrometer": "fluorescence_spectra",
+        "lifetime": "fluorescence_lifetime",
+        "scattering_image": "scattering",
+    }
 
-def decode_raw_file(path):
-    from pathlib import Path
-    from lif_thesis.data.parsers import parse_raw_file
-
-    path = Path(path)
-
-    parsed = parse_raw_file(
-        path,
-        keep_thresholds=False,
-        extra_params=True,
-    )
-
-    df = parsed.particle_data.copy()
-
-    df["raw_file"] = path.name
-    df["raw_path"] = str(path)
-    df["filename"] = path.name
-
-    if "spectrometer" in df.columns and "fluorescence_spectra" not in df.columns:
-        df["fluorescence_spectra"] = df["spectrometer"]
-
-    if "lifetime" in df.columns and "fluorescence_lifetime" not in df.columns:
-        df["fluorescence_lifetime"] = df["lifetime"]
-
-    if "scattering_image" in df.columns and "scattering" not in df.columns:
-        df["scattering"] = df["scattering_image"]
+    for source, target in column_aliases.items():
+        if source in df.columns and target not in df.columns:
+            df[target] = df[source]
 
     return df
+
 
 
 def parse_timestamp_from_name(filename: str) -> Optional[datetime]:

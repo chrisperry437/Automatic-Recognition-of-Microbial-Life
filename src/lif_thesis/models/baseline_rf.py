@@ -1,11 +1,14 @@
-##Baseline Random Forest classifier for LIF thesis experiments
+"""
+Baseline Random Forest classifier utilities for LIF thesis experiments.
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
 import json
-import joblib
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 
@@ -22,6 +25,46 @@ from sklearn.preprocessing import LabelEncoder
 from lif_thesis.data.splits import make_group_split
 
 
+@dataclass(slots=True)
+class BaselineRFConfig:
+    n_estimators: int = 500
+    max_depth: int | None = None
+    criterion: str = "gini"
+    min_samples_split: int = 2
+    min_samples_leaf: int = 1
+    max_features: str | int | float = "sqrt"
+    class_weight: str | dict | None = "balanced"
+    n_jobs: int = -1
+    random_state: int = 42
+
+
+def make_baseline_rf(
+    n_estimators: int = 500,
+    max_depth: int | None = None,
+    random_state: int = 42,
+) -> RandomForestClassifier:
+    config = BaselineRFConfig(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        random_state=random_state,
+    )
+    return build_baseline_rf(config)
+
+
+def build_baseline_rf(config: BaselineRFConfig) -> RandomForestClassifier:
+    return RandomForestClassifier(
+        n_estimators=config.n_estimators,
+        criterion=config.criterion,
+        max_depth=config.max_depth,
+        min_samples_split=config.min_samples_split,
+        min_samples_leaf=config.min_samples_leaf,
+        max_features=config.max_features,
+        class_weight=config.class_weight,
+        n_jobs=config.n_jobs,
+        random_state=config.random_state,
+    )
+
+
 def _to_array(x):
     if isinstance(x, np.ndarray):
         return x
@@ -34,12 +77,6 @@ def build_spectra_matrix(
     df: pd.DataFrame,
     spectra_col: str = "spectrometer",
 ) -> np.ndarray:
-    """
-    Convert parsed spectrometer vectors into a 2D ML matrix.
-
-    Output shape:
-        (n_particles, n_spectral_features)
-    """
     if spectra_col not in df.columns:
         raise ValueError(f"{spectra_col} not found in dataframe.")
 
@@ -60,26 +97,14 @@ def build_spectra_matrix(
 def train_baseline_rf(
     X_train: np.ndarray,
     y_train: np.ndarray,
+    config: BaselineRFConfig | None = None,
     random_state: int = 42,
 ) -> RandomForestClassifier:
-    """
-    Baseline Random Forest model.
+    config = config or BaselineRFConfig(random_state=random_state)
 
-    This is intentionally simple and defensible as an initial baseline.
-    """
-    model = RandomForestClassifier(
-        n_estimators=500,
-        criterion="gini",
-        max_depth=None,
-        min_samples_split=2,
-        min_samples_leaf=1,
-        max_features="sqrt",
-        class_weight="balanced",
-        n_jobs=-1,
-        random_state=random_state,
-    )
-
+    model = build_baseline_rf(config)
     model.fit(X_train, y_train)
+
     return model
 
 
@@ -90,20 +115,17 @@ def evaluate_classifier(
     label_encoder: LabelEncoder,
     split_name: str,
 ) -> dict:
-    """
-    Evaluate classifier and return metrics.
-    """
     y_pred = model.predict(X)
 
     labels = np.arange(len(label_encoder.classes_))
     target_names = label_encoder.classes_.astype(str)
 
-    metrics = {
+    return {
         "split": split_name,
         "accuracy": accuracy_score(y, y_pred),
         "balanced_accuracy": balanced_accuracy_score(y, y_pred),
-        "macro_f1": f1_score(y, y_pred, average="macro"),
-        "weighted_f1": f1_score(y, y_pred, average="weighted"),
+        "macro_f1": f1_score(y, y_pred, average="macro", zero_division=0),
+        "weighted_f1": f1_score(y, y_pred, average="weighted", zero_division=0),
         "confusion_matrix": confusion_matrix(y, y_pred, labels=labels).tolist(),
         "classification_report": classification_report(
             y,
@@ -115,8 +137,6 @@ def evaluate_classifier(
         ),
     }
 
-    return metrics
-
 
 def run_baseline_rf_experiment(
     df: pd.DataFrame,
@@ -124,23 +144,13 @@ def run_baseline_rf_experiment(
     group_col: str = "raw_file",
     spectra_col: str = "spectrometer",
     output_dir: str | Path = "results/baseline_rf",
+    config: BaselineRFConfig | None = None,
     random_state: int = 42,
 ):
-    """
-    Full baseline RF experiment.
-
-    Steps:
-    1. Filter usable rows
-    2. Build spectra feature matrix
-    3. Encode labels
-    4. Create grouped train/val/test split
-    5. Train RF
-    6. Evaluate
-    7. Save model, label encoder, metrics, and split indices
-    """
-
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    config = config or BaselineRFConfig(random_state=random_state)
 
     required_cols = [label_col, group_col, spectra_col]
     missing = [col for col in required_cols if col not in df.columns]
@@ -173,7 +183,7 @@ def run_baseline_rf_experiment(
         val_size=0.15,
         test_size=0.15,
         stratify=True,
-        random_state=random_state,
+        random_state=config.random_state,
         verbose=True,
     )
 
@@ -184,25 +194,20 @@ def run_baseline_rf_experiment(
     model = train_baseline_rf(
         X_train,
         y_train,
-        random_state=random_state,
+        config=config,
     )
 
     metrics = {
-        "train": evaluate_classifier(
-            model, X_train, y_train, label_encoder, "train"
-        ),
-        "val": evaluate_classifier(
-            model, X_val, y_val, label_encoder, "val"
-        ),
-        "test": evaluate_classifier(
-            model, X_test, y_test, label_encoder, "test"
-        ),
+        "config": asdict(config),
+        "train": evaluate_classifier(model, X_train, y_train, label_encoder, "train"),
+        "val": evaluate_classifier(model, X_val, y_val, label_encoder, "val"),
+        "test": evaluate_classifier(model, X_test, y_test, label_encoder, "test"),
     }
 
     joblib.dump(model, output_dir / "baseline_rf.joblib")
     joblib.dump(label_encoder, output_dir / "label_encoder.joblib")
 
-    with open(output_dir / "metrics.json", "w") as f:
+    with open(output_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=4)
 
     np.save(output_dir / "train_idx.npy", train_idx)
@@ -212,3 +217,14 @@ def run_baseline_rf_experiment(
     print(f"\nSaved outputs to: {output_dir}")
 
     return model, label_encoder, metrics, (train_idx, val_idx, test_idx)
+
+
+__all__ = [
+    "BaselineRFConfig",
+    "make_baseline_rf",
+    "build_baseline_rf",
+    "build_spectra_matrix",
+    "train_baseline_rf",
+    "evaluate_classifier",
+    "run_baseline_rf_experiment",
+]

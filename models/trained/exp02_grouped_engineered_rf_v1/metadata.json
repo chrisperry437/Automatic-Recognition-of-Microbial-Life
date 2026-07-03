@@ -1,0 +1,26 @@
+{
+    "model_id": "exp02_grouped_engineered_rf_v1",
+    "display_name": "Exp02 Grouped Engineered RF",
+    "model_type": "sklearn_random_forest",
+    "framework": "sklearn",
+    "model_file": "model.joblib",
+    "labels_file": "labels.json",
+    "label_encoder_file": "label_encoder.joblib",
+    "feature_names_file": "feature_names.json",
+    "preprocessing": {
+        "fluorescence_threshold": 2000.0,
+        "scattering_target_acquisitions": 60,
+        "n_scattering_angles": 24,
+        "scattering_normalize": true,
+        "feature_set": "lifetime+scalar",
+        "scalar_features": [
+            "size",
+            "time_asymmetry"
+        ]
+    },
+    "performance": {
+        "test_accuracy": 0.833605220228385,
+        "test_balanced_accuracy": 0.6643427798661221,
+        "test_macro_f1": 0.6538662695943566
+    }
+}

@@ -82,6 +82,13 @@ class InferenceEngineConfig:
     unknown_label: str = "unknown"
 
     fluorescence_threshold: float = 2000.0
+    print("\nQC DEBUG")
+    print(f"Loaded particles: {len(df)}")
+    print(f"Accepted > threshold: {len(accepted)}")
+    print(f"Rejected <= threshold: {len(rejected)}")
+
+    if "peak_fluorescence" in df.columns:
+        print(df["peak_fluorescence"].describe())
     scattering_target_acquisitions: int = RAPIDE_DIMS.SCATTERING_TARGET_ACQUISITIONS
     scattering_normalize: bool = True
 

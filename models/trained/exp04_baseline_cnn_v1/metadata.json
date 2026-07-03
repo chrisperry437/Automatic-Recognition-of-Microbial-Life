@@ -1,0 +1,32 @@
+{
+    "model_id": "exp04_baseline_cnn_v1",
+    "display_name": "Experiment 04 Baseline CNN",
+    "model_type": "torch_cnn1d",
+    "framework": "torch",
+    "model_file": "model.pt",
+    "labels_file": "labels.json",
+    "label_encoder_file": "label_encoder.joblib",
+    "architecture": "BaselineCNN1D",
+    "model_module": "lif_thesis.models.cnn1d",
+    "preprocessing": {
+        "spectra_col": "spectrometer",
+        "fluorescence_threshold": 2000.0,
+        "spectra_scaler": "spectra_scaler.joblib",
+        "uses_spectrometer": true
+    },
+    "training": {
+        "batch_size": 128,
+        "max_epochs": 50,
+        "learning_rate": 0.001,
+        "weight_decay": 0.0001,
+        "patience": 8,
+        "random_state": 42
+    },
+    "performance": {
+        "best_epoch": 19,
+        "val_balanced_accuracy": 0.45109770312666103,
+        "val_macro_f1": 0.4448852489459589,
+        "test_balanced_accuracy": 0.4430017390720463,
+        "test_macro_f1": 0.44094893164961685
+    }
+}

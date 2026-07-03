@@ -1,0 +1,34 @@
+{
+    "model_id": "exp06_robust_multimodal_species_v1",
+    "display_name": "Exp06 Robust Multimodal CNN",
+    "model_type": "torch_multimodal_robust",
+    "model_file": "model.pt",
+    "labels_file": "labels.json",
+    "architecture": "RobustMultimodalClassifier",
+    "model_module": "lif_thesis.models.robust_multimodal_cnn",
+    "preprocessing": {
+        "fluorescence_threshold": 2000.0,
+        "scattering_target_acquisitions": 60,
+        "n_scattering_angles": 24,
+        "scattering_normalize": true,
+        "spectrometer_scaler": "spectrometer_scaler.joblib",
+        "lifetime_scaler": "lifetime_scaler.joblib",
+        "scattering_scaler": "scattering_scaler.joblib",
+        "scalar_scaler": "scalar_scaler.joblib"
+    },
+    "uses_rejection": true,
+    "rejection": {
+        "softmax_threshold": 0.8,
+        "margin_threshold": 0.15,
+        "entropy_threshold": null,
+        "use_train_distance_rejection": true,
+        "train_distance_quantile": 0.995
+    },
+    "performance": {
+        "best_epoch": 30,
+        "closed_set_accuracy": 0.8890701468189234,
+        "closed_set_balanced_accuracy": 0.7936031743748154,
+        "closed_set_macro_f1": 0.7872684600917618,
+        "unknown_fraction": 0.2830342577487765
+    }
+}

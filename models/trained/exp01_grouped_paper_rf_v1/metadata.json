@@ -1,0 +1,23 @@
+{
+    "model_id": "exp01_grouped_paper_rf_v1",
+    "display_name": "Experiment 01 Grouped Paper RF",
+    "model_type": "sklearn_random_forest",
+    "framework": "sklearn",
+    "model_file": "model.joblib",
+    "labels_file": "labels.json",
+    "label_encoder_file": "label_encoder.joblib",
+    "feature_names_file": "feature_names.json",
+    "preprocessing": {
+        "fluorescence_threshold": 2000.0,
+        "scattering_target_acquisitions": 60,
+        "n_scattering_angles": 24,
+        "scattering_normalize": true,
+        "feature_set": "lifetime"
+    },
+    "performance": {
+        "train_balanced_accuracy": 1.0,
+        "val_balanced_accuracy": 0.6852602507293613,
+        "test_balanced_accuracy": 0.6590460077454854,
+        "test_macro_f1": 0.644170811175454
+    }
+}

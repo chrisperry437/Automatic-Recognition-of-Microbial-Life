@@ -1,0 +1,26 @@
+{
+    "model_id": "exp05_multimodal_species_v1",
+    "display_name": "Exp05 Multimodal CNN",
+    "model_type": "torch_multimodal",
+    "model_file": "model.pt",
+    "labels_file": "labels.json",
+    "architecture": "MultimodalDeepClassifier",
+    "model_module": "lif_thesis.models.multimodal_cnn",
+    "preprocessing": {
+        "fluorescence_threshold": 2000.0,
+        "scattering_target_acquisitions": 60,
+        "n_scattering_angles": 24,
+        "scattering_normalize": true,
+        "spectrometer_scaler": "spectrometer_scaler.joblib",
+        "lifetime_scaler": "lifetime_scaler.joblib",
+        "scattering_scaler": "scattering_scaler.joblib",
+        "scalar_scaler": "scalar_scaler.joblib"
+    },
+    "performance": {
+        "best_epoch": 20,
+        "test_accuracy": 0.8760195758564437,
+        "test_balanced_accuracy": 0.7685103845179807,
+        "test_macro_f1": 0.768984878768286
+    },
+    "uses_rejection": false
+}

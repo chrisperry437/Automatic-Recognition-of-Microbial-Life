@@ -15,8 +15,8 @@ Protocol:
 
 from __future__ import annotations
 
-from pathlib import Path
 import json
+from pathlib import Path
 
 import joblib
 import numpy as np
@@ -24,7 +24,6 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from lif_thesis.data.schemas import RAPIDE_DIMS
 
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import (
@@ -35,16 +34,17 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 
+from lif_thesis.data.schemas import RAPIDE_DIMS
 from lif_thesis.data.splits import make_group_split
+from lif_thesis.models.multimodal_cnn import MultimodalDeepClassifier
 
 
 DATA_PATH = Path("data/processed/bacterial_samples.parquet")
 OUTPUT_DIR = Path("results/exp05_multimodal_deep_learning")
 
+MODEL_ID = "exp05_multimodal_species_v1"
+DEPLOY_DIR = Path("models/trained") / MODEL_ID
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
 
 def to_array(x) -> np.ndarray:
     if isinstance(x, np.ndarray):
@@ -67,15 +67,7 @@ def crop_pad_scattering(
     n_acquisitions: int = RAPIDE_DIMS.SCATTERING_TARGET_ACQUISITIONS,
     n_angles: int = RAPIDE_DIMS.N_SCATTERING_ANGLES,
 ) -> np.ndarray:
-    """
-    Paper-style scattering processing:
-    - crop to 30 us equivalent
-    - {n_acquisitions} acquisitions x {n_angles} angles = {n_acquisitions * n_angles} features
-    - zero pad shorter signals
-    - normalize each particle to [0, 1]
-    """
     target_len = n_acquisitions * n_angles
-
     arr = to_array(scattering).astype(float).flatten()
 
     if len(arr) >= target_len:
@@ -97,7 +89,10 @@ def build_inputs(df: pd.DataFrame):
 
     X_scalar = df[["size", "time_asymmetry"]].copy()
     X_scalar["size"] = pd.to_numeric(X_scalar["size"], errors="coerce")
-    X_scalar["time_asymmetry"] = pd.to_numeric(X_scalar["time_asymmetry"], errors="coerce")
+    X_scalar["time_asymmetry"] = pd.to_numeric(
+        X_scalar["time_asymmetry"],
+        errors="coerce",
+    )
 
     if X_scalar.isna().any().any():
         raise ValueError(f"Missing scalar values:\n{X_scalar.isna().sum()}")
@@ -109,10 +104,6 @@ def build_inputs(df: pd.DataFrame):
         X_scalar.to_numpy(dtype=np.float32),
     )
 
-
-# ------------------------------------------------------------
-# Dataset
-# ------------------------------------------------------------
 
 class MultimodalParticleDataset(Dataset):
     def __init__(
@@ -142,119 +133,8 @@ class MultimodalParticleDataset(Dataset):
         }
 
 
-# ------------------------------------------------------------
-# Model
-# ------------------------------------------------------------
-
-class ConvBranch1D(nn.Module):
-    def __init__(self, in_channels: int, out_dim: int, dropout: float = 0.2):
-        super().__init__()
-
-        self.net = nn.Sequential(
-            nn.Conv1d(in_channels, 32, kernel_size=5, padding=2),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-
-            nn.Conv1d(32, 64, kernel_size=5, padding=2),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-
-            nn.Conv1d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-
-            nn.Dropout(dropout),
-            nn.Linear(128, out_dim),
-            nn.ReLU(),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class ScalarBranch(nn.Module):
-    def __init__(self, input_dim: int, out_dim: int):
-        super().__init__()
-
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 16),
-            nn.ReLU(),
-            nn.BatchNorm1d(16),
-            nn.Dropout(0.1),
-            nn.Linear(16, out_dim),
-            nn.ReLU(),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class MultimodalDeepClassifier(nn.Module):
-    def __init__(self, n_classes: int):
-        super().__init__()
-
-        self.spectrometer_branch = ConvBranch1D(
-            in_channels=1,
-            out_dim=64,
-            dropout=0.25,
-        )
-
-        self.lifetime_branch = ConvBranch1D(
-            in_channels=1,
-            out_dim=64,
-            dropout=0.25,
-        )
-
-        self.scattering_branch = ConvBranch1D(
-            in_channels=1,
-            out_dim=64,
-            dropout=0.25,
-        )
-
-        self.scalar_branch = ScalarBranch(
-            input_dim=2,
-            out_dim=16,
-        )
-
-        fusion_dim = 64 + 64 + 64 + 16
-
-        self.classifier = nn.Sequential(
-            nn.Linear(fusion_dim, 128),
-            nn.ReLU(),
-            nn.BatchNorm1d(128),
-            nn.Dropout(0.35),
-
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(0.20),
-
-            nn.Linear(64, n_classes),
-        )
-
-    def forward(self, batch):
-        z_spec = self.spectrometer_branch(batch["spectrometer"])
-        z_life = self.lifetime_branch(batch["lifetime"])
-        z_scat = self.scattering_branch(batch["scattering"])
-        z_scalar = self.scalar_branch(batch["scalar"])
-
-        z = torch.cat([z_spec, z_life, z_scat, z_scalar], dim=1)
-        return self.classifier(z)
-
-
-# ------------------------------------------------------------
-# Training / evaluation
-# ------------------------------------------------------------
-
 def move_batch_to_device(batch, device):
-    return {
-        key: value.to(device)
-        for key, value in batch.items()
-    }
+    return {key: value.to(device) for key, value in batch.items()}
 
 
 def train_one_epoch(model, loader, optimizer, criterion, device):
@@ -331,11 +211,7 @@ def compute_metrics(y_true, y_pred, label_encoder):
         "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
         "macro_f1": f1_score(y_true, y_pred, average="macro", zero_division=0),
         "weighted_f1": f1_score(y_true, y_pred, average="weighted", zero_division=0),
-        "confusion_matrix": confusion_matrix(
-            y_true,
-            y_pred,
-            labels=labels,
-        ).tolist(),
+        "confusion_matrix": confusion_matrix(y_true, y_pred, labels=labels).tolist(),
         "classification_report": classification_report(
             y_true,
             y_pred,
@@ -347,17 +223,9 @@ def compute_metrics(y_true, y_pred, label_encoder):
     }
 
 
-# ------------------------------------------------------------
-# Main experiment
-# ------------------------------------------------------------
-
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    DEPLOY_MODEL_DIR = Path("models/trained")
-    DEPLOY_CONFIG_DIR = Path("models/configs")
-    DEPLOY_LABEL_DIR = Path("models/label_maps")
-    MODEL_NAME = "multimodal_species_v1"
+    DEPLOY_DIR.mkdir(parents=True, exist_ok=True)
 
     label_col = "species"
     group_col = "raw_file"
@@ -426,7 +294,6 @@ def main():
         verbose=True,
     )
 
-    # Scale each modality using training data only.
     spec_scaler = StandardScaler()
     life_scaler = StandardScaler()
     scat_scaler = StandardScaler()
@@ -577,6 +444,7 @@ def main():
     metrics = {
         "experiment": {
             "name": "exp05_multimodal_deep_learning",
+            "model_id": MODEL_ID,
             "label_col": label_col,
             "group_col": group_col,
             "input_features": [
@@ -588,31 +456,21 @@ def main():
             ],
             "fluorescence_threshold": fluorescence_threshold,
             "split_protocol": "grouped_raw_file_60_train_20_val_20_test",
-            "model": "multimodal_deep_classifier",
+            "model": "MultimodalDeepClassifier",
         },
         "best_epoch": best_epoch,
-        "train": compute_metrics(
-            train_eval["y_true"],
-            train_eval["y_pred"],
-            label_encoder,
-        ),
-        "val": compute_metrics(
-            val_eval["y_true"],
-            val_eval["y_pred"],
-            label_encoder,
-        ),
-        "test": compute_metrics(
-            test_eval["y_true"],
-            test_eval["y_pred"],
-            label_encoder,
-        ),
+        "train": compute_metrics(train_eval["y_true"], train_eval["y_pred"], label_encoder),
+        "val": compute_metrics(val_eval["y_true"], val_eval["y_pred"], label_encoder),
+        "test": compute_metrics(test_eval["y_true"], test_eval["y_pred"], label_encoder),
     }
 
     deployment_checkpoint = {
         "model_state_dict": model.state_dict(),
         "n_classes": len(label_encoder.classes_),
         "class_names": label_encoder.classes_.astype(str).tolist(),
-        "model_name": MODEL_NAME,
+        "model_id": MODEL_ID,
+        "architecture": "MultimodalDeepClassifier",
+        "model_module": "lif_thesis.models.multimodal_cnn",
         "input_features": [
             "spectrometer",
             "lifetime",
@@ -623,28 +481,54 @@ def main():
         "fluorescence_threshold": fluorescence_threshold,
         "scattering_target_acquisitions": RAPIDE_DIMS.SCATTERING_TARGET_ACQUISITIONS,
         "n_scattering_angles": RAPIDE_DIMS.N_SCATTERING_ANGLES,
+        "best_epoch": best_epoch,
+        "test_accuracy": metrics["test"]["accuracy"],
+        "test_balanced_accuracy": metrics["test"]["balanced_accuracy"],
+        "test_macro_f1": metrics["test"]["macro_f1"],
     }
-    DEPLOY_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    DEPLOY_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    DEPLOY_LABEL_DIR.mkdir(parents=True, exist_ok=True)
-    
-    torch.save(
-        deployment_checkpoint,
-        DEPLOY_MODEL_DIR / f"{MODEL_NAME}.pt",
-    )
+
+    torch.save(deployment_checkpoint, DEPLOY_DIR / "model.pt")
 
     label_mapping = {
         int(i): str(label)
         for i, label in enumerate(label_encoder.classes_)
     }
 
-    with open(DEPLOY_LABEL_DIR / f"{MODEL_NAME}_labels.json", "w") as f:
-        json.dump(label_mapping, f, indent=4)
-    
+    metadata = {
+        "model_id": MODEL_ID,
+        "display_name": "Exp05 Multimodal CNN",
+        "model_type": "torch_multimodal",
+        "model_file": "model.pt",
+        "labels_file": "labels.json",
+        "architecture": "MultimodalDeepClassifier",
+        "model_module": "lif_thesis.models.multimodal_cnn",
+        "preprocessing": {
+            "fluorescence_threshold": fluorescence_threshold,
+            "scattering_target_acquisitions": RAPIDE_DIMS.SCATTERING_TARGET_ACQUISITIONS,
+            "n_scattering_angles": RAPIDE_DIMS.N_SCATTERING_ANGLES,
+            "scattering_normalize": True,
+            "spectrometer_scaler": "spectrometer_scaler.joblib",
+            "lifetime_scaler": "lifetime_scaler.joblib",
+            "scattering_scaler": "scattering_scaler.joblib",
+            "scalar_scaler": "scalar_scaler.joblib",
+        },
+        "performance": {
+            "best_epoch": best_epoch,
+            "test_accuracy": metrics["test"]["accuracy"],
+            "test_balanced_accuracy": metrics["test"]["balanced_accuracy"],
+            "test_macro_f1": metrics["test"]["macro_f1"],
+        },
+        "uses_rejection": False,
+    }
 
-
-    with open(OUTPUT_DIR / "metrics.json", "w") as f:
+    with open(OUTPUT_DIR / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=4)
+
+    with open(DEPLOY_DIR / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=4)
+
+    with open(DEPLOY_DIR / "labels.json", "w", encoding="utf-8") as f:
+        json.dump(label_mapping, f, indent=4)
 
     pd.DataFrame(history).to_csv(
         OUTPUT_DIR / "training_history.csv",
@@ -656,17 +540,19 @@ def main():
     joblib.dump(life_scaler, OUTPUT_DIR / "lifetime_scaler.joblib")
     joblib.dump(scat_scaler, OUTPUT_DIR / "scattering_scaler.joblib")
     joblib.dump(scalar_scaler, OUTPUT_DIR / "scalar_scaler.joblib")
-    joblib.dump(spec_scaler, DEPLOY_CONFIG_DIR / f"{MODEL_NAME}_spectrometer_scaler.joblib")
-    joblib.dump(life_scaler, DEPLOY_CONFIG_DIR / f"{MODEL_NAME}_lifetime_scaler.joblib")
-    joblib.dump(scat_scaler, DEPLOY_CONFIG_DIR / f"{MODEL_NAME}_scattering_scaler.joblib")
-    joblib.dump(scalar_scaler, DEPLOY_CONFIG_DIR / f"{MODEL_NAME}_scalar_scaler.joblib")
-    joblib.dump(label_encoder, DEPLOY_LABEL_DIR / f"{MODEL_NAME}_label_encoder.joblib")
+
+    joblib.dump(label_encoder, DEPLOY_DIR / "label_encoder.joblib")
+    joblib.dump(spec_scaler, DEPLOY_DIR / "spectrometer_scaler.joblib")
+    joblib.dump(life_scaler, DEPLOY_DIR / "lifetime_scaler.joblib")
+    joblib.dump(scat_scaler, DEPLOY_DIR / "scattering_scaler.joblib")
+    joblib.dump(scalar_scaler, DEPLOY_DIR / "scalar_scaler.joblib")
 
     np.save(OUTPUT_DIR / "train_idx.npy", train_idx)
     np.save(OUTPUT_DIR / "val_idx.npy", val_idx)
     np.save(OUTPUT_DIR / "test_idx.npy", test_idx)
 
-    print(f"\nSaved outputs to: {OUTPUT_DIR}")
+    print(f"\nSaved experiment outputs to: {OUTPUT_DIR}")
+    print(f"Saved deployable model bundle to: {DEPLOY_DIR}")
 
     print("\nFinal test performance:")
     print(

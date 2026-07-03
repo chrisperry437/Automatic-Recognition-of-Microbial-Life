@@ -1,11 +1,13 @@
 from pathlib import Path
+import sqlite3
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 
-PREDICTIONS_PATH = Path("./results/realtime/predictions.csv")
+DB_PATH = Path("./results/realtime/predictions.sqlite")
+MAX_ROWS_TO_LOAD = 50_000
 
 st.set_page_config(
     page_title="Raw File Explorer",
@@ -13,27 +15,41 @@ st.set_page_config(
     layout="wide",
 )
 
+st.divider()
 st.title("📁 Raw File Explorer")
 
 
 @st.cache_data(ttl=2)
-def load_predictions(path: Path) -> pd.DataFrame:
-    if not path.exists():
+def load_predictions_from_db(
+    db_path: Path,
+    limit: int = MAX_ROWS_TO_LOAD,
+) -> pd.DataFrame:
+    if not db_path.exists():
         return pd.DataFrame()
 
-    df = pd.read_csv(path)
+    query = """
+        SELECT *
+        FROM predictions
+        ORDER BY rowid DESC
+        LIMIT ?
+    """
 
-    for col in ["processed_at", "event_time", "timestamp"]:
+    with sqlite3.connect(db_path) as conn:
+        df = pd.read_sql_query(query, conn, params=(limit,))
+
+    df = df.iloc[::-1].reset_index(drop=True)
+
+    for col in ["processed_at", "event_time", "timestamp", "stored_at"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
     return df
 
 
-df = load_predictions(PREDICTIONS_PATH)
+df = load_predictions_from_db(DB_PATH)
 
 if df.empty:
-    st.warning(f"No predictions found at: {PREDICTIONS_PATH}")
+    st.warning(f"No predictions found in SQLite database at: {DB_PATH}")
     st.stop()
 
 
@@ -52,33 +68,167 @@ if missing:
     st.stop()
 
 
-st.sidebar.header("Raw File Filters")
+st.subheader("Filters")
+
+time_col = "timestamp" if "timestamp" in df.columns else "processed_at"
+df = df.dropna(subset=[time_col]).copy()
+
+if df.empty:
+    st.warning("Predictions found, but no valid timestamps are available.")
+    st.stop()
+
+min_datetime = df[time_col].min()
+max_datetime = df[time_col].max()
+
+filter_col1, filter_col2, filter_col3 = st.columns([1, 1, 2])
+
+with filter_col1:
+    start_date = st.date_input(
+        "Start date",
+        value=min_datetime.date(),
+        min_value=min_datetime.date(),
+        max_value=max_datetime.date(),
+        key="raw_file_start_date",
+    )
+
+    start_time = st.time_input(
+        "Start time",
+        value=min_datetime.time(),
+        key="raw_file_start_time",
+    )
+
+with filter_col2:
+    end_date = st.date_input(
+        "End date",
+        value=max_datetime.date(),
+        min_value=min_datetime.date(),
+        max_value=max_datetime.date(),
+        key="raw_file_end_date",
+    )
+
+    end_time = st.time_input(
+        "End time",
+        value=max_datetime.time(),
+        key="raw_file_end_time",
+    )
+
+start_datetime = pd.Timestamp.combine(start_date, start_time)
+end_datetime = pd.Timestamp.combine(end_date, end_time)
+
+if start_datetime > end_datetime:
+    st.warning("Start datetime must be before end datetime.")
+    st.stop()
+
+time_filtered_df = df[
+    (df[time_col] >= start_datetime)
+    & (df[time_col] <= end_datetime)
+].copy()
+
+if time_filtered_df.empty:
+    st.warning("No raw files found in the selected datetime range.")
+    st.stop()
+
 
 raw_summary = (
-    df.groupby("raw_file")
+    time_filtered_df
+    .groupby("raw_file")
     .agg(
         particle_count=("raw_file", "size"),
         mean_confidence=("prediction_confidence", "mean"),
-        first_timestamp=("timestamp", "min"),
-        last_timestamp=("timestamp", "max"),
+        first_timestamp=(time_col, "min"),
+        last_timestamp=(time_col, "max"),
+        dominant_species=(
+            "predicted_label",
+            lambda x: x.value_counts().idxmax(),
+        ),
     )
     .reset_index()
     .sort_values("last_timestamp", ascending=False)
 )
 
-raw_file_options = raw_summary["raw_file"].tolist()
+with filter_col3:
+    dominant_species_options = sorted(
+        raw_summary["dominant_species"]
+        .dropna()
+        .unique()
+        .tolist()
+    )
 
-selected_raw_file = st.sidebar.selectbox(
+    selected_dominant_species = st.multiselect(
+        "Dominant species in raw file",
+        dominant_species_options,
+        default=dominant_species_options,
+        key="raw_file_dominant_species_filter",
+    )
+
+    min_file_confidence = st.slider(
+        "Minimum file mean confidence",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.0,
+        step=0.05,
+        key="raw_file_mean_confidence_filter",
+    )
+
+raw_summary = raw_summary[
+    raw_summary["dominant_species"].isin(selected_dominant_species)
+    & (raw_summary["mean_confidence"] >= min_file_confidence)
+].copy()
+
+if raw_summary.empty:
+    st.warning("No raw files match the selected file-level filters.")
+    st.stop()
+
+selected_raw_file = st.selectbox(
     "Select raw file",
-    raw_file_options,
+    raw_summary["raw_file"].tolist(),
     key="raw_file_explorer_selected_file",
 )
 
-selected_df = df[df["raw_file"] == selected_raw_file].copy()
+selected_df = time_filtered_df[
+    time_filtered_df["raw_file"] == selected_raw_file
+].copy()
+
+
+st.subheader("Particle-Level Filters Within Selected Raw File")
+
+particle_filter_col1, particle_filter_col2 = st.columns([2, 1])
+
+with particle_filter_col1:
+    species_options = sorted(
+        selected_df["predicted_label"]
+        .dropna()
+        .unique()
+        .tolist()
+    )
+
+    selected_particle_species = st.multiselect(
+        "Predicted species within selected file",
+        species_options,
+        default=species_options,
+        key="raw_file_particle_species_filter",
+    )
+
+with particle_filter_col2:
+    min_particle_confidence = st.slider(
+        "Minimum particle confidence",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.0,
+        step=0.05,
+        key="raw_file_particle_confidence_filter",
+    )
+
+selected_df = selected_df[
+    selected_df["predicted_label"].isin(selected_particle_species)
+    & (selected_df["prediction_confidence"] >= min_particle_confidence)
+].copy()
 
 if selected_df.empty:
-    st.warning("No particles found for selected raw file.")
+    st.warning("No particles in this raw file match the selected particle-level filters.")
     st.stop()
+
+st.divider()
 
 
 st.subheader("Raw File Overview")
@@ -89,15 +239,9 @@ mean_confidence = selected_df["prediction_confidence"].mean()
 median_confidence = selected_df["prediction_confidence"].median()
 mean_size = selected_df["size"].mean()
 
-time_col = "timestamp" if "timestamp" in selected_df.columns else None
-
-if time_col:
-    valid_time = selected_df.dropna(subset=[time_col])
-    start_time = valid_time[time_col].min() if not valid_time.empty else None
-    end_time = valid_time[time_col].max() if not valid_time.empty else None
-else:
-    start_time = None
-    end_time = None
+valid_time = selected_df.dropna(subset=[time_col])
+start_time_value = valid_time[time_col].min() if not valid_time.empty else None
+end_time_value = valid_time[time_col].max() if not valid_time.empty else None
 
 col1, col2, col3, col4 = st.columns(4)
 
@@ -106,10 +250,10 @@ col2.metric("Mean confidence", f"{mean_confidence:.1%}")
 col3.metric("Median confidence", f"{median_confidence:.1%}")
 col4.metric("Mean size", f"{mean_size:.2f} µm")
 
-if start_time is not None and end_time is not None:
+if start_time_value is not None and end_time_value is not None:
     col1, col2 = st.columns(2)
-    col1.info(f"Start time: {start_time}")
-    col2.info(f"End time: {end_time}")
+    col1.info(f"Start time: {start_time_value}")
+    col2.info(f"End time: {end_time_value}")
 
 
 st.divider()
@@ -219,7 +363,7 @@ st.divider()
 
 st.subheader("Raw File Timeline")
 
-if "timestamp" not in selected_df.columns or selected_df["timestamp"].isna().all():
+if selected_df[time_col].isna().all():
     st.info("No valid timestamp column available for this raw file.")
 else:
     time_bin = st.selectbox(
@@ -229,8 +373,8 @@ else:
         key="raw_file_timeline_bin",
     )
 
-    timeline = selected_df.dropna(subset=["timestamp"]).copy()
-    timeline["time_bin"] = timeline["timestamp"].dt.floor(time_bin)
+    timeline = selected_df.dropna(subset=[time_col]).copy()
+    timeline["time_bin"] = timeline[time_col].dt.floor(time_bin)
 
     timeline_counts = (
         timeline
@@ -340,4 +484,9 @@ st.dataframe(
     ),
     use_container_width=True,
     hide_index=True,
+)
+
+st.caption(
+    f"Loaded at most the most recent {MAX_ROWS_TO_LOAD:,} rows from SQLite: "
+    f"{DB_PATH}."
 )

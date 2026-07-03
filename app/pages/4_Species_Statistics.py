@@ -1,11 +1,13 @@
 from pathlib import Path
+import sqlite3
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 
-PREDICTIONS_PATH = Path("./results/realtime/predictions.csv")
+DB_PATH = Path("./results/realtime/predictions.sqlite")
+MAX_ROWS_TO_LOAD = 50_000
 
 st.set_page_config(
     page_title="Species Statistics",
@@ -13,6 +15,7 @@ st.set_page_config(
     layout="wide",
 )
 
+st.divider()
 st.title("🧫 Species-Specific Statistics")
 
 
@@ -81,23 +84,36 @@ SPECIES_INFO = {
 
 
 @st.cache_data(ttl=2)
-def load_predictions(path: Path) -> pd.DataFrame:
-    if not path.exists():
+def load_predictions_from_db(
+    db_path: Path,
+    limit: int = MAX_ROWS_TO_LOAD,
+) -> pd.DataFrame:
+    if not db_path.exists():
         return pd.DataFrame()
 
-    df = pd.read_csv(path)
+    query = """
+        SELECT *
+        FROM predictions
+        ORDER BY rowid DESC
+        LIMIT ?
+    """
 
-    for col in ["processed_at", "event_time", "timestamp"]:
+    with sqlite3.connect(db_path) as conn:
+        df = pd.read_sql_query(query, conn, params=(limit,))
+
+    df = df.iloc[::-1].reset_index(drop=True)
+
+    for col in ["processed_at", "event_time", "timestamp", "stored_at"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
     return df
 
 
-df = load_predictions(PREDICTIONS_PATH)
+df = load_predictions_from_db(DB_PATH)
 
 if df.empty:
-    st.warning(f"No predictions found at: {PREDICTIONS_PATH}")
+    st.warning(f"No predictions found in SQLite database at: {DB_PATH}")
     st.stop()
 
 
@@ -115,27 +131,41 @@ if missing_cols:
     st.stop()
 
 
-st.sidebar.header("Filters")
+st.subheader("Filters")
 
-selected_species = st.sidebar.selectbox(
-    "Species",
-    ["All"] + sorted(df["predicted_label"].dropna().unique().tolist()),
-    key="species_stats_species_filter",
-)
+available_species = sorted(df["predicted_label"].dropna().unique().tolist())
 
-min_confidence = st.sidebar.slider(
-    "Minimum confidence",
-    min_value=0.0,
-    max_value=1.0,
-    value=0.0,
-    step=0.05,
-    key="species_stats_min_confidence",
-)
+filter_col1, filter_col2 = st.columns([1, 2])
+
+with filter_col1:
+    selected_species = st.multiselect(
+        "Species",
+        available_species,
+        default=available_species,
+        key="species_stats_species_filter",
+    )
+
+with filter_col2:
+    min_confidence = st.slider(
+        "Minimum confidence",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.0,
+        step=0.05,
+        key="species_stats_min_confidence",
+    )
+
+st.divider()
 
 filtered = df[df["prediction_confidence"] >= min_confidence].copy()
 
-if selected_species != "All":
-    filtered = filtered[filtered["predicted_label"] == selected_species].copy()
+if selected_species:
+    filtered = filtered[
+        filtered["predicted_label"].isin(selected_species)
+    ].copy()
+else:
+    st.warning("Select at least one species.")
+    st.stop()
 
 if filtered.empty:
     st.warning("No particles match the selected filters.")
@@ -183,32 +213,9 @@ st.dataframe(
 
 st.divider()
 
-st.subheader("Species Composition")
-
-fig = px.bar(
-    species_stats.sort_values("particle_count", ascending=False),
-    x="predicted_label",
-    y="percentage_of_filtered_sample",
-    text=species_stats["percentage_of_filtered_sample"].round(1),
-    title="Predicted species composition",
-)
-
-fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-fig.update_yaxes(title="Percentage", range=[0, 100])
-fig.update_xaxes(title="Predicted species")
-
-st.plotly_chart(fig, use_container_width=True)
-
-
-st.divider()
-
 st.subheader("Biological Information")
 
-species_to_show = (
-    sorted(filtered["predicted_label"].dropna().unique().tolist())
-    if selected_species == "All"
-    else [selected_species]
-)
+species_to_show = sorted(filtered["predicted_label"].dropna().unique().tolist())
 
 for species in species_to_show:
     info = SPECIES_INFO.get(species)
@@ -216,7 +223,10 @@ for species in species_to_show:
     if info is None:
         continue
 
-    with st.expander(f"{species} — {info['full_name']}", expanded=(selected_species != "All")):
+    with st.expander(
+        f"{species} — {info['full_name']}",
+        expanded=(len(species_to_show) == 1),
+    ):
         col1, col2, col3, col4 = st.columns(4)
 
         col1.metric("Phylum", info["phylum"])
@@ -363,4 +373,9 @@ st.dataframe(
     .sort_index(ascending=False),
     use_container_width=True,
     hide_index=True,
+)
+
+st.caption(
+    f"Loaded at most the most recent {MAX_ROWS_TO_LOAD:,} rows from SQLite: "
+    f"{DB_PATH}."
 )

@@ -1,11 +1,13 @@
 from pathlib import Path
+import sqlite3
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 
-PREDICTIONS_PATH = Path("./results/realtime/predictions.csv")
+DB_PATH = Path("./results/realtime/predictions.sqlite")
+MAX_ROWS_TO_LOAD = 50_000
 
 st.set_page_config(
     page_title="Particle Profiles",
@@ -13,27 +15,41 @@ st.set_page_config(
     layout="wide",
 )
 
+st.divider()
 st.title("🔬 Particle Profiles")
 
 
 @st.cache_data(ttl=2)
-def load_predictions(path: Path) -> pd.DataFrame:
-    if not path.exists():
+def load_predictions_from_db(
+    db_path: Path,
+    limit: int = MAX_ROWS_TO_LOAD,
+) -> pd.DataFrame:
+    if not db_path.exists():
         return pd.DataFrame()
 
-    df = pd.read_csv(path)
+    query = """
+        SELECT *
+        FROM predictions
+        ORDER BY rowid DESC
+        LIMIT ?
+    """
 
-    for col in ["processed_at", "event_time", "timestamp"]:
+    with sqlite3.connect(db_path) as conn:
+        df = pd.read_sql_query(query, conn, params=(limit,))
+
+    df = df.iloc[::-1].reset_index(drop=True)
+
+    for col in ["processed_at", "event_time", "timestamp", "stored_at"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
     return df
 
 
-df = load_predictions(PREDICTIONS_PATH)
+df = load_predictions_from_db(DB_PATH)
 
 if df.empty:
-    st.warning(f"No predictions found at: {PREDICTIONS_PATH}")
+    st.warning(f"No predictions found in SQLite database at: {DB_PATH}")
     st.stop()
 
 
@@ -47,32 +63,41 @@ prob_cols = [
 
 available_prob_cols = [col for col in prob_cols if col in df.columns]
 
-st.sidebar.header("Filters")
 
-selected_label = st.sidebar.selectbox(
-    "Predicted class",
-    ["All"] + sorted(df["predicted_label"].dropna().unique().tolist()),
-)
+st.subheader("Filters")
 
-min_confidence = st.sidebar.slider(
-    "Minimum confidence",
-    min_value=0.0,
-    max_value=1.0,
-    value=0.0,
-    step=0.05,
-)
+filter_col1, filter_col2 = st.columns([1, 2])
+
+with filter_col1:
+    selected_label = st.selectbox(
+        "Predicted class",
+        ["All"] + sorted(df["predicted_label"].dropna().unique().tolist()),
+        key="particle_profiles_label_filter",
+    )
+
+with filter_col2:
+    min_confidence = st.slider(
+        "Minimum confidence",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.0,
+        step=0.05,
+        key="particle_profiles_min_confidence",
+    )
 
 filtered = df.copy()
 
 if selected_label != "All":
-    filtered = filtered[filtered["predicted_label"] == selected_label]
+    filtered = filtered[filtered["predicted_label"] == selected_label].copy()
 
-filtered = filtered[filtered["prediction_confidence"] >= min_confidence]
+filtered = filtered[filtered["prediction_confidence"] >= min_confidence].copy()
 
 if filtered.empty:
     st.warning("No particles match the selected filters.")
     st.stop()
 
+
+st.divider()
 
 st.subheader("Select a Particle")
 
@@ -81,19 +106,18 @@ filtered = filtered.sort_values(
     ascending=[False, True, True],
 ).reset_index(drop=True)
 
-# Tier 1: raw file
 raw_files = filtered["raw_file"].dropna().unique().tolist()
 
 selected_raw_file = st.selectbox(
     "Raw file",
     raw_files,
+    key="particle_profiles_raw_file_selector",
 )
 
 file_particles = filtered[
     filtered["raw_file"] == selected_raw_file
 ].copy()
 
-# Tier 2: predicted class within that raw file
 available_classes = (
     file_particles["predicted_label"]
     .dropna()
@@ -103,8 +127,9 @@ available_classes = (
 )
 
 selected_particle_class = st.selectbox(
-    "Predicted class",
+    "Predicted class within raw file",
     ["All"] + available_classes,
+    key="particle_profiles_file_class_selector",
 )
 
 if selected_particle_class != "All":
@@ -112,13 +137,13 @@ if selected_particle_class != "All":
         file_particles["predicted_label"] == selected_particle_class
     ].copy()
 
-# Tier 3: confidence range
 confidence_range = st.slider(
-    "Confidence range",
+    "Confidence range within raw file",
     min_value=0.0,
     max_value=1.0,
     value=(0.0, 1.0),
     step=0.01,
+    key="particle_profiles_confidence_range",
 )
 
 file_particles = file_particles[
@@ -132,7 +157,6 @@ if file_particles.empty:
     st.warning("No particles match this file/class/confidence filter.")
     st.stop()
 
-# Tier 4: particle index, now from a much smaller filtered set
 particle_indices = (
     file_particles["particle_index"]
     .astype(int)
@@ -144,6 +168,7 @@ particle_indices = (
 selected_particle_index = st.selectbox(
     "Particle index",
     particle_indices,
+    key="particle_profiles_particle_index_selector",
 )
 
 particle_matches = file_particles[
@@ -175,6 +200,7 @@ with left:
         "timestamp",
         "processed_at",
         "event_time",
+        "stored_at",
         "predicted_class_index",
     ]
 
@@ -240,22 +266,23 @@ context_window = st.slider(
     min_value=5,
     max_value=100,
     value=25,
+    key="particle_profiles_context_window",
 )
 
 same_file = df[df["raw_file"] == particle["raw_file"]].copy()
-same_file = same_file.sort_values("particle_index")
+same_file = same_file.sort_values("particle_index").reset_index(drop=True)
 
-particle_position = same_file.index[
-    same_file["particle_index"] == particle["particle_index"]
-]
+matching_positions = same_file.index[
+    same_file["particle_index"].astype(int) == int(particle["particle_index"])
+].tolist()
 
-if len(particle_position) > 0:
-    pos = particle_position[0]
+if matching_positions:
+    pos = matching_positions[0]
 
-    context = same_file.loc[
-        max(pos - context_window, same_file.index.min()):
-        min(pos + context_window, same_file.index.max())
-    ].copy()
+    start_pos = max(pos - context_window, 0)
+    end_pos = min(pos + context_window + 1, len(same_file))
+
+    context = same_file.iloc[start_pos:end_pos].copy()
 
     fig = px.scatter(
         context,
@@ -341,8 +368,15 @@ display_cols = [
     "prediction_confidence",
 ]
 
+available_display_cols = [col for col in display_cols if col in filtered.columns]
+
 st.dataframe(
-    filtered[display_cols].head(100),
+    filtered[available_display_cols].head(100),
     use_container_width=True,
     hide_index=True,
+)
+
+st.caption(
+    f"Loaded at most the most recent {MAX_ROWS_TO_LOAD:,} rows from SQLite: "
+    f"{DB_PATH}."
 )

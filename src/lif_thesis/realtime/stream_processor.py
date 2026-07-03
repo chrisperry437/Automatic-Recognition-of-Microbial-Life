@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 from lif_thesis.realtime.multimodal_inference_engine import MultimodalInferenceEngine
+from lif_thesis.realtime.prediction_store import create_prediction_store
 
 import pandas as pd
 
@@ -257,6 +258,7 @@ def save_prediction_outputs(
             append=append,
         )
 
+
     file_summary = make_file_summary(predictions, source_file)
 
     append_or_write_csv(
@@ -280,6 +282,17 @@ def save_prediction_outputs(
             append=append,
         )
 
+    # Also write outputs to SQLite
+    store = create_prediction_store(output_dir=output_dir)
+
+    if not predictions.empty:
+        store.save_predictions(predictions_to_save)
+
+    store.save_file_summary(file_summary)
+
+    if not label_summary.empty:
+        store.save_label_summary(label_summary)
+
 
 def process_file(
     path: Path,
@@ -298,11 +311,25 @@ def process_file(
         predictions = predictor.predict_particles(particles)
 
     if config.save_particle_predictions or config.save_minute_summaries:
-        save_prediction_outputs(
-            predictions=predictions,
-            source_file=path,
+        store = create_prediction_store(
             output_dir=config.output_dir,
-            append=config.append_outputs,
+            backend="both",
+        )
+
+        model_path = getattr(predictor, "model_path", None)
+
+        if model_path is not None:
+            model_name = Path(model_path).stem
+        else:
+            model_name = "multimodal_species_v1"
+
+        predictions["model_name"] = model_name
+
+
+        store.save_batch(
+            predictions=predictions,
+            source_file=path.name,
+            batch_id=path.stem,
         )
 
     logger.info(

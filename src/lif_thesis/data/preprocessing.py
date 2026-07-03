@@ -376,7 +376,19 @@ def crop_or_pad_scattering(
         return np.full((target_acquisitions, 1), fill_value, dtype=float)
 
     if arr.ndim == 1:
-        arr = arr.reshape(-1, 1)
+        n_angles = RAPIDE_DIMS.N_SCATTERING_ANGLES
+        remainder = arr.size % n_angles
+
+        if remainder != 0:
+            pad_width = n_angles - remainder
+            arr = np.pad(
+                arr,
+                (0, pad_width),
+                mode="constant",
+                constant_values=fill_value,
+            )
+
+        arr = arr.reshape(-1, n_angles)
 
     if arr.ndim > 2:
         arr = arr.reshape(arr.shape[0], -1)

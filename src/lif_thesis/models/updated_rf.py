@@ -1,10 +1,18 @@
-## Baseline Random Forest classifier for LIF thesis experiments
+"""
+Updated Random Forest utilities for Exp01 and Exp02.
+
+Supports:
+- multimodal RF feature construction
+- grouped-CV RF tuning
+- model evaluation
+- deployable model bundle saving via checkpoint.py
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
 import json
-import joblib
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -12,41 +20,61 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     balanced_accuracy_score,
     classification_report,
     confusion_matrix,
     f1_score,
     roc_auc_score,
-    average_precision_score,
 )
+from sklearn.model_selection import GridSearchCV, StratifiedGroupKFold
 from sklearn.preprocessing import LabelEncoder
 
 from lif_thesis.data.splits import make_group_split
+from lif_thesis.models.checkpoint import save_model_bundle
 
-from sklearn.model_selection import GridSearchCV, StratifiedGroupKFold
-from sklearn.ensemble import RandomForestClassifier
+
+@dataclass(slots=True)
+class UpdatedRFConfig:
+    n_estimators_grid: tuple[int, ...] = (300, 500)
+    max_depth_grid: tuple[int | None, ...] = (None, 20, 40)
+    min_samples_split_grid: tuple[int, ...] = (2, 5)
+    min_samples_leaf_grid: tuple[int, ...] = (1, 2, 4)
+    max_features_grid: tuple[str, ...] = ("sqrt", "log2")
+
+    class_weight: str = "balanced"
+    criterion: str = "gini"
+    n_jobs: int = -1
+    random_state: int = 42
+    cv_splits: int = 3
+    scoring: str = "balanced_accuracy"
+
+
+def make_updated_rf(
+    n_estimators: int = 500,
+    max_depth: int | None = None,
+    random_state: int = 42,
+) -> RandomForestClassifier:
+    return RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        criterion="gini",
+        class_weight="balanced",
+        max_features="sqrt",
+        n_jobs=-1,
+        random_state=random_state,
+    )
 
 
 def _to_array(x) -> np.ndarray:
-    """
-    Convert list-like values stored in parquet into numpy arrays.
-    """
     if isinstance(x, np.ndarray):
         return x
-
     if isinstance(x, list):
         return np.asarray(x)
-
     return np.asarray(x)
 
 
-def _safe_stack_vector_column(
-    df: pd.DataFrame,
-    col: str,
-) -> np.ndarray:
-    """
-    Stack a dataframe column containing list-like vectors into a 2D matrix.
-    """
+def _safe_stack_vector_column(df: pd.DataFrame, col: str) -> np.ndarray:
     if col not in df.columns:
         raise ValueError(f"{col} not found in dataframe.")
 
@@ -65,12 +93,6 @@ def build_spectra_matrix(
     df: pd.DataFrame,
     spectra_col: str = "spectrometer",
 ) -> np.ndarray:
-    """
-    Convert parsed spectrometer vectors into a 2D ML matrix.
-
-    Output shape:
-        (n_particles, n_spectral_features)
-    """
     return _safe_stack_vector_column(df, spectra_col)
 
 
@@ -83,24 +105,6 @@ def build_multimodal_feature_matrix(
     include_lifetime: bool = True,
     include_scalars: bool = True,
 ) -> tuple[np.ndarray, list[str]]:
-    """
-    Build feature matrix from spectrometer, lifetime, and scalar features.
-
-    Features included by default:
-    - spectrometer vector
-    - lifetime vector
-    - size
-    - time_asymmetry
-
-    Returns
-    -------
-    X : np.ndarray
-        Feature matrix.
-
-    feature_names : list[str]
-        Names corresponding to feature columns.
-    """
-
     if scalar_cols is None:
         scalar_cols = ["size", "time_asymmetry"]
 
@@ -110,16 +114,12 @@ def build_multimodal_feature_matrix(
     if include_spectrometer:
         X_spec = _safe_stack_vector_column(df, spectra_col)
         feature_parts.append(X_spec)
-        feature_names.extend(
-            [f"{spectra_col}_{i}" for i in range(X_spec.shape[1])]
-        )
+        feature_names.extend([f"{spectra_col}_{i}" for i in range(X_spec.shape[1])])
 
     if include_lifetime:
         X_life = _safe_stack_vector_column(df, lifetime_col)
         feature_parts.append(X_life)
-        feature_names.extend(
-            [f"{lifetime_col}_{i}" for i in range(X_life.shape[1])]
-        )
+        feature_names.extend([f"{lifetime_col}_{i}" for i in range(X_life.shape[1])])
 
     if include_scalars:
         missing_scalars = [col for col in scalar_cols if col not in df.columns]
@@ -152,46 +152,41 @@ def build_multimodal_feature_matrix(
     return X, feature_names
 
 
-def train_baseline_rf(
+def train_updated_rf(
     X_train: np.ndarray,
     y_train: np.ndarray,
     groups_train: np.ndarray,
-    random_state: int = 42,
-) -> RandomForestClassifier:
-    """
-    Train Random Forest with grouped cross-validation.
-
-    Groups prevent particles from the same raw_file appearing
-    in both training and validation folds during hyperparameter tuning.
-    """
+    config: UpdatedRFConfig | None = None,
+) -> tuple[RandomForestClassifier, dict]:
+    config = config or UpdatedRFConfig()
 
     base_model = RandomForestClassifier(
-        criterion="gini",
-        class_weight="balanced",
-        n_jobs=-1,
-        random_state=random_state,
+        criterion=config.criterion,
+        class_weight=config.class_weight,
+        n_jobs=config.n_jobs,
+        random_state=config.random_state,
     )
 
     param_grid = {
-        "n_estimators": [300, 500],
-        "max_depth": [None, 20, 40],
-        "min_samples_split": [2, 5],
-        "min_samples_leaf": [1, 2, 4],
-        "max_features": ["sqrt", "log2"],
+        "n_estimators": list(config.n_estimators_grid),
+        "max_depth": list(config.max_depth_grid),
+        "min_samples_split": list(config.min_samples_split_grid),
+        "min_samples_leaf": list(config.min_samples_leaf_grid),
+        "max_features": list(config.max_features_grid),
     }
 
     cv = StratifiedGroupKFold(
-        n_splits=3,
+        n_splits=config.cv_splits,
         shuffle=True,
-        random_state=random_state,
+        random_state=config.random_state,
     )
 
     grid_search = GridSearchCV(
         estimator=base_model,
         param_grid=param_grid,
-        scoring="balanced_accuracy",
+        scoring=config.scoring,
         cv=cv,
-        n_jobs=-1,
+        n_jobs=config.n_jobs,
         verbose=2,
         refit=True,
     )
@@ -202,22 +197,17 @@ def train_baseline_rf(
         groups=groups_train,
     )
 
-    print("\nBest RF parameters:")
-    print(grid_search.best_params_)
+    tuning_summary = {
+        "best_params": grid_search.best_params_,
+        "best_cv_score": float(grid_search.best_score_),
+        "scoring": config.scoring,
+        "cv_splits": config.cv_splits,
+    }
 
-    print("\nBest grouped-CV balanced accuracy:")
-    print(grid_search.best_score_)
-
-    return grid_search.best_estimator_
+    return grid_search.best_estimator_, tuning_summary
 
 
-def _safe_roc_auc(
-    y: np.ndarray,
-    y_proba: np.ndarray,
-) -> float | None:
-    """
-    Compute ROC-AUC safely for binary or multiclass classification.
-    """
+def _safe_roc_auc(y: np.ndarray, y_proba: np.ndarray) -> float | None:
     try:
         if y_proba.shape[1] == 2:
             return float(roc_auc_score(y, y_proba[:, 1]))
@@ -234,14 +224,7 @@ def _safe_roc_auc(
         return None
 
 
-def _safe_pr_auc(
-    y: np.ndarray,
-    y_proba: np.ndarray,
-) -> float | None:
-    """
-    Compute PR-AUC safely for binary or multiclass classification.
-    Uses macro average precision for multiclass.
-    """
+def _safe_pr_auc(y: np.ndarray, y_proba: np.ndarray) -> float | None:
     try:
         n_classes = y_proba.shape[1]
 
@@ -271,16 +254,13 @@ def evaluate_classifier(
     label_encoder: LabelEncoder,
     split_name: str,
 ) -> dict:
-    """
-    Evaluate classifier and return metrics.
-    """
     y_pred = model.predict(X)
     y_proba = model.predict_proba(X)
 
     labels = np.arange(len(label_encoder.classes_))
     target_names = label_encoder.classes_.astype(str)
 
-    metrics = {
+    return {
         "split": split_name,
         "accuracy": accuracy_score(y, y_pred),
         "balanced_accuracy": balanced_accuracy_score(y, y_pred),
@@ -288,11 +268,7 @@ def evaluate_classifier(
         "weighted_f1": f1_score(y, y_pred, average="weighted", zero_division=0),
         "roc_auc": _safe_roc_auc(y, y_proba),
         "pr_auc": _safe_pr_auc(y, y_proba),
-        "confusion_matrix": confusion_matrix(
-            y,
-            y_pred,
-            labels=labels,
-        ).tolist(),
+        "confusion_matrix": confusion_matrix(y, y_pred, labels=labels).tolist(),
         "classification_report": classification_report(
             y,
             y_pred,
@@ -303,40 +279,26 @@ def evaluate_classifier(
         ),
     }
 
-    return metrics
 
-
-def run_baseline_rf_experiment(
+def run_updated_rf_experiment(
     df: pd.DataFrame,
+    *,
+    model_id: str,
+    display_name: str,
     label_col: str = "species",
     group_col: str = "raw_file",
     spectra_col: str = "spectrometer",
     lifetime_col: str = "lifetime",
     scalar_cols: list[str] | None = None,
-    output_dir: str | Path = "results/baseline_rf_multimodal",
+    output_dir: str | Path = "results/updated_rf",
+    deploy_dir: str | Path = "models/trained",
+    config: UpdatedRFConfig | None = None,
     random_state: int = 42,
 ):
-    """
-    Full baseline RF experiment.
-
-    Features:
-    - spectrometer
-    - lifetime
-    - size
-    - time_asymmetry
-
-    Steps:
-    1. Filter usable rows
-    2. Build multimodal feature matrix
-    3. Encode labels
-    4. Create grouped train/val/test split
-    5. Train RF
-    6. Evaluate
-    7. Save model, label encoder, feature names, metrics, and split indices
-    """
-
     if scalar_cols is None:
         scalar_cols = ["size", "time_asymmetry"]
+
+    config = config or UpdatedRFConfig(random_state=random_state)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -350,7 +312,6 @@ def run_baseline_rf_experiment(
     ]
 
     missing = [col for col in required_cols if col not in df.columns]
-
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
@@ -364,13 +325,9 @@ def run_baseline_rf_experiment(
     )
 
     for col in scalar_cols:
-        usable_mask = usable_mask & df[col].notna()
+        usable_mask &= df[col].notna()
 
     df = df[usable_mask].reset_index(drop=True)
-
-    print(f"Using {len(df)} valid particle rows.")
-    print(f"Number of labels: {df[label_col].nunique()}")
-    print(f"Number of groups: {df[group_col].nunique()}")
 
     X, feature_names = build_multimodal_feature_matrix(
         df,
@@ -381,9 +338,6 @@ def run_baseline_rf_experiment(
         include_lifetime=True,
         include_scalars=True,
     )
-
-    print(f"Feature matrix shape: {X.shape}")
-    print(f"Number of features: {len(feature_names)}")
 
     label_encoder = LabelEncoder()
     y = label_encoder.fit_transform(df[label_col].astype(str))
@@ -396,7 +350,7 @@ def run_baseline_rf_experiment(
         val_size=0.15,
         test_size=0.15,
         stratify=True,
-        random_state=random_state,
+        random_state=config.random_state,
         verbose=True,
     )
 
@@ -406,38 +360,111 @@ def run_baseline_rf_experiment(
 
     groups_train = df.iloc[train_idx][group_col].values
 
-    model = train_baseline_rf(
+    model, tuning_summary = train_updated_rf(
         X_train=X_train,
         y_train=y_train,
         groups_train=groups_train,
-        random_state=random_state,
+        config=config,
     )
 
     metrics = {
-        "train": evaluate_classifier(
-            model, X_train, y_train, label_encoder, "train"
-        ),
-        "val": evaluate_classifier(
-            model, X_val, y_val, label_encoder, "val"
-        ),
-        "test": evaluate_classifier(
-            model, X_test, y_test, label_encoder, "test"
-        ),
+        "experiment": {
+            "model_id": model_id,
+            "display_name": display_name,
+            "model_type": "sklearn_random_forest",
+            "label_col": label_col,
+            "group_col": group_col,
+            "feature_columns": {
+                "spectra_col": spectra_col,
+                "lifetime_col": lifetime_col,
+                "scalar_cols": scalar_cols,
+            },
+            "split_protocol": "grouped_raw_file_70_train_15_val_15_test",
+        },
+        "config": asdict(config),
+        "tuning": tuning_summary,
+        "train": evaluate_classifier(model, X_train, y_train, label_encoder, "train"),
+        "val": evaluate_classifier(model, X_val, y_val, label_encoder, "val"),
+        "test": evaluate_classifier(model, X_test, y_test, label_encoder, "test"),
     }
 
-    joblib.dump(model, output_dir / "baseline_rf_multimodal.joblib")
-    joblib.dump(label_encoder, output_dir / "label_encoder.joblib")
+    label_mapping = {
+        int(i): str(label)
+        for i, label in enumerate(label_encoder.classes_)
+    }
 
-    with open(output_dir / "feature_names.json", "w") as f:
-        json.dump(feature_names, f, indent=4)
+    checkpoint = {
+        "model_id": model_id,
+        "model_type": "sklearn_random_forest",
+        "framework": "sklearn",
+        "model_module": "lif_thesis.models.updated_rf",
+        "class_names": label_encoder.classes_.astype(str).tolist(),
+        "feature_names": feature_names,
+        "feature_columns": {
+            "spectra_col": spectra_col,
+            "lifetime_col": lifetime_col,
+            "scalar_cols": scalar_cols,
+        },
+        "tuning": tuning_summary,
+        "config": asdict(config),
+    }
 
-    with open(output_dir / "metrics.json", "w") as f:
+    metadata = {
+        "model_id": model_id,
+        "display_name": display_name,
+        "model_type": "sklearn_random_forest",
+        "framework": "sklearn",
+        "model_file": "model.joblib",
+        "labels_file": "labels.json",
+        "label_encoder_file": "label_encoder.joblib",
+        "feature_names_file": "feature_names.json",
+        "preprocessing": {
+            "uses_spectrometer": True,
+            "uses_lifetime": True,
+            "uses_scalars": True,
+            "scalar_cols": scalar_cols,
+        },
+        "performance": {
+            "val_balanced_accuracy": metrics["val"]["balanced_accuracy"],
+            "val_macro_f1": metrics["val"]["macro_f1"],
+            "test_balanced_accuracy": metrics["test"]["balanced_accuracy"],
+            "test_macro_f1": metrics["test"]["macro_f1"],
+        },
+    }
+
+    save_model_bundle(
+        model=model,
+        model_id=model_id,
+        deploy_dir=Path(deploy_dir),
+        checkpoint=checkpoint,
+        metadata=metadata,
+        label_mapping=label_mapping,
+        label_encoder=label_encoder,
+        framework="sklearn",
+        extra_artifacts={
+            "feature_names.json": feature_names,
+        },
+    )
+
+    with open(output_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=4)
+
+    with open(output_dir / "feature_names.json", "w", encoding="utf-8") as f:
+        json.dump(feature_names, f, indent=4)
 
     np.save(output_dir / "train_idx.npy", train_idx)
     np.save(output_dir / "val_idx.npy", val_idx)
     np.save(output_dir / "test_idx.npy", test_idx)
 
-    print(f"\nSaved outputs to: {output_dir}")
-
     return model, label_encoder, metrics, (train_idx, val_idx, test_idx)
+
+
+__all__ = [
+    "UpdatedRFConfig",
+    "make_updated_rf",
+    "build_spectra_matrix",
+    "build_multimodal_feature_matrix",
+    "train_updated_rf",
+    "evaluate_classifier",
+    "run_updated_rf_experiment",
+]

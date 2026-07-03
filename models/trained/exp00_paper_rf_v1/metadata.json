@@ -1,19 +1,24 @@
 {
-    "model_name": "exp00_paper_rf_v1",
-    "model_type": "RandomForestClassifier",
+    "model_id": "exp00_paper_rf_v1",
+    "display_name": "Exp00 Paper RF Baseline",
+    "model_type": "sklearn_random_forest",
+    "model_file": "model.joblib",
+    "labels_file": "labels.json",
+    "label_encoder_file": "label_encoder.joblib",
+    "feature_names_file": "feature_names.json",
     "framework": "sklearn",
     "task": "multiclass_species_classification",
     "feature_set": "lifetime",
-    "feature_names_file": "feature_names.json",
-    "label_encoder_file": "label_encoder.joblib",
-    "model_file": "model.joblib",
-    "label_col": "species",
-    "fluorescence_threshold": 2000,
-    "random_state": 42,
-    "metrics": {
-        "accuracy": 0.8065878378378378,
-        "balanced_accuracy": 0.6540166740181055,
-        "macro_f1": 0.6409954168900996
+    "preprocessing": {
+        "fluorescence_threshold": 2000.0,
+        "scattering_target_acquisitions": 60,
+        "n_scattering_angles": 24,
+        "scattering_normalize": true
+    },
+    "performance": {
+        "validation_accuracy": 0.8065878378378378,
+        "validation_balanced_accuracy": 0.6540166740181055,
+        "validation_macro_f1": 0.6409954168900996
     },
     "notes": "Paper-style particle-level split; not grouped by raw_file."
 }

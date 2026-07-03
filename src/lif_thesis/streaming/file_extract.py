@@ -12,7 +12,7 @@ USERNAME = "Rapid-E-user"
 PASSWORD = "QEYKvnnw"
 
 REMOTE_DIR = "/DATA/D_00001"
-LOCAL_DIR = Path("rapid_e_downloads")
+LOCAL_DIR = Path("data/live_rapid_e/experiment")
 LOCAL_DIR.mkdir(exist_ok=True)
 
 # Set to None to download newest file.

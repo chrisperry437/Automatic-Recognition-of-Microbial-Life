@@ -1,0 +1,27 @@
+{
+    "model_id": "exp03_tuned_rf_v1",
+    "display_name": "Exp03 Tuned RF",
+    "model_type": "sklearn_random_forest",
+    "framework": "sklearn",
+    "model_file": "model.joblib",
+    "labels_file": "labels.json",
+    "label_encoder_file": "label_encoder.joblib",
+    "feature_names_file": "feature_names.json",
+    "preprocessing": {
+        "fluorescence_threshold": 2000.0,
+        "uses_spectrometer": true,
+        "uses_lifetime": true,
+        "uses_scalars": true,
+        "scalar_cols": [
+            "size",
+            "time_asymmetry"
+        ]
+    },
+    "performance": {
+        "test_accuracy": 0.8531810766721044,
+        "test_balanced_accuracy": 0.7159157053317522,
+        "test_macro_f1": 0.7210033261952352,
+        "simple_test_balanced_accuracy": 0.6535884685025372,
+        "balanced_accuracy_delta": 0.06232723682921504
+    }
+}

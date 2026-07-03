@@ -1,4 +1,5 @@
 from pathlib import Path
+import sqlite3
 
 import pandas as pd
 import plotly.express as px
@@ -6,7 +7,8 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 
-PREDICTIONS_PATH = Path("./results/realtime/predictions.csv")
+DB_PATH = Path("./results/realtime/predictions.sqlite")
+MAX_ROWS_TO_LOAD = 50_000
 
 st.set_page_config(
     page_title="Live Predictions",
@@ -14,6 +16,7 @@ st.set_page_config(
     layout="wide",
 )
 
+st.divider()
 st.title("🦠 Live Predictions")
 
 refresh_seconds = st.sidebar.slider(
@@ -28,23 +31,36 @@ st_autorefresh(interval=refresh_seconds * 1000, key="refresh")
 
 
 @st.cache_data(ttl=2)
-def load_predictions(path: Path) -> pd.DataFrame:
-    if not path.exists():
+def load_predictions_from_db(
+    db_path: Path,
+    limit: int = MAX_ROWS_TO_LOAD,
+) -> pd.DataFrame:
+    if not db_path.exists():
         return pd.DataFrame()
 
-    df = pd.read_csv(path)
+    query = """
+        SELECT *
+        FROM predictions
+        ORDER BY rowid DESC
+        LIMIT ?
+    """
 
-    for col in ["processed_at", "event_time", "timestamp"]:
+    with sqlite3.connect(db_path) as conn:
+        df = pd.read_sql_query(query, conn, params=(limit,))
+
+    df = df.iloc[::-1].reset_index(drop=True)
+
+    for col in ["processed_at", "event_time", "timestamp", "stored_at"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
     return df
 
 
-df = load_predictions(PREDICTIONS_PATH)
+df = load_predictions_from_db(DB_PATH)
 
 if df.empty:
-    st.warning(f"No predictions found at: {PREDICTIONS_PATH}")
+    st.warning(f"No predictions found in SQLite database at: {DB_PATH}")
     st.stop()
 
 
@@ -52,7 +68,7 @@ latest = df.iloc[-1]
 
 col1, col2, col3, col4 = st.columns(4)
 
-col1.metric("Total particles", f"{len(df):,}")
+col1.metric("Loaded particles", f"{len(df):,}")
 col2.metric("Latest class", latest["predicted_label"])
 col3.metric("Confidence", f"{latest['prediction_confidence']:.1%}")
 col4.metric("Mean size", f"{df['size'].mean():.2f} µm")
@@ -94,30 +110,63 @@ st.divider()
 
 st.subheader("Predictions Over Time")
 
+timeline_window_minutes = st.slider(
+    "Timeline window in minutes",
+    min_value=1,
+    max_value=30,
+    value=30,
+    step=1,
+    key="live_predictions_timeline_window",
+)
+
+timeline_bin = st.selectbox(
+    "Timeline bin",
+    ["10s", "30s", "1min", "5min"],
+    index=0,
+    key="live_predictions_timeline_bin",
+)
+
 timeline = df.dropna(subset=["timestamp"]).copy()
 
 if timeline.empty:
     st.info("No valid timestamps available for timeline.")
 else:
-    timeline["time_bin"] = timeline["timestamp"].dt.floor("10s")
+    latest_time = timeline["timestamp"].max()
+    start_time = latest_time - pd.Timedelta(minutes=timeline_window_minutes)
 
-    timeline_counts = (
-        timeline
-        .groupby(["time_bin", "predicted_label"])
-        .size()
-        .reset_index(name="count")
-    )
+    timeline = timeline[
+        (timeline["timestamp"] >= start_time)
+        & (timeline["timestamp"] <= latest_time)
+    ].copy()
 
-    fig = px.line(
-        timeline_counts,
-        x="time_bin",
-        y="count",
-        color="predicted_label",
-        markers=True,
-        title="Predictions per 10 seconds",
-    )
+    if timeline.empty:
+        st.info("No predictions found in the selected timeline window.")
+    else:
+        timeline["time_bin"] = timeline["timestamp"].dt.floor(timeline_bin)
 
-    st.plotly_chart(fig, use_container_width=True)
+        timeline_counts = (
+            timeline
+            .groupby(["time_bin", "predicted_label"])
+            .size()
+            .reset_index(name="count")
+        )
+
+        fig = px.line(
+            timeline_counts,
+            x="time_bin",
+            y="count",
+            color="predicted_label",
+            markers=True,
+            title=f"Predictions per {timeline_bin}",
+        )
+
+        fig.update_xaxes(
+            title="Time",
+            range=[start_time, latest_time],
+        )
+        fig.update_yaxes(title="Particle count")
+
+        st.plotly_chart(fig, use_container_width=True)
 
 
 st.divider()
@@ -201,6 +250,15 @@ else:
 
 st.subheader("Composition Trend Over Time")
 
+composition_window_minutes = st.slider(
+    "Composition trend window in minutes",
+    min_value=1,
+    max_value=30,
+    value=30,
+    step=1,
+    key="composition_trend_window_minutes",
+)
+
 trend_bin = st.selectbox(
     "Time bin",
     ["10s", "30s", "1min", "5min"],
@@ -213,52 +271,82 @@ composition_timeline = df.dropna(subset=["timestamp"]).copy()
 if composition_timeline.empty:
     st.info("No valid timestamps available for composition trend.")
 else:
-    composition_timeline["time_bin"] = composition_timeline["timestamp"].dt.floor(
-        trend_bin
-    )
+    latest_time = composition_timeline["timestamp"].max()
+    start_time = latest_time - pd.Timedelta(minutes=composition_window_minutes)
 
-    composition_timeline = (
-        composition_timeline
-        .groupby(["time_bin", "predicted_label"])
-        .size()
-        .reset_index(name="count")
-    )
+    composition_timeline = composition_timeline[
+        (composition_timeline["timestamp"] >= start_time)
+        & (composition_timeline["timestamp"] <= latest_time)
+    ].copy()
 
-    composition_timeline["total_in_bin"] = (
-        composition_timeline
-        .groupby("time_bin")["count"]
-        .transform("sum")
-    )
+    if composition_timeline.empty:
+        st.info("No predictions found in the selected composition trend window.")
+    else:
+        composition_timeline["time_bin"] = composition_timeline[
+            "timestamp"
+        ].dt.floor(trend_bin)
 
-    composition_timeline["percentage"] = (
-        composition_timeline["count"]
-        / composition_timeline["total_in_bin"]
-        * 100
-    )
+        composition_timeline = (
+            composition_timeline
+            .groupby(["time_bin", "predicted_label"])
+            .size()
+            .reset_index(name="count")
+        )
 
-    fig = px.area(
-        composition_timeline,
-        x="time_bin",
-        y="percentage",
-        color="predicted_label",
-        title="Estimated bacterial composition over time",
-    )
+        composition_timeline["total_in_bin"] = (
+            composition_timeline
+            .groupby("time_bin")["count"]
+            .transform("sum")
+        )
 
-    fig.update_yaxes(title="Percentage", range=[0, 100])
-    fig.update_xaxes(title="Time")
+        composition_timeline["percentage"] = (
+            composition_timeline["count"]
+            / composition_timeline["total_in_bin"]
+            * 100
+        )
 
-    st.plotly_chart(fig, use_container_width=True)
+        fig = px.area(
+            composition_timeline,
+            x="time_bin",
+            y="percentage",
+            color="predicted_label",
+            title="Estimated bacterial composition over time",
+        )
+
+        fig.update_yaxes(title="Percentage", range=[0, 100])
+        fig.update_xaxes(
+            title="Time",
+            range=[start_time, latest_time],
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
 
 
 st.divider()
 
 st.subheader("Particle Profile Statistics")
 
+profile_max = min(len(df), MAX_ROWS_TO_LOAD)
+
+if profile_max < 1000:
+    profile_df = df.copy()
+else:
+    profile_sample_size = st.slider(
+        "Maximum particles shown in profile plots",
+        min_value=1_000,
+        max_value=profile_max,
+        value=min(profile_max, 10_000),
+        step=1_000,
+        key="profile_plot_sample_size",
+    )
+
+    profile_df = df.tail(profile_sample_size).copy()
+
 col1, col2 = st.columns(2)
 
 with col1:
     fig = px.histogram(
-        df,
+        profile_df,
         x="size",
         nbins=40,
         color="predicted_label",
@@ -269,7 +357,7 @@ with col1:
 
 with col2:
     fig = px.scatter(
-        df,
+        profile_df,
         x="size",
         y="time_asymmetry",
         color="predicted_label",
@@ -350,4 +438,9 @@ available_display_cols = [col for col in display_cols if col in df.columns]
 st.dataframe(
     df[available_display_cols].tail(rows).sort_index(ascending=False),
     use_container_width=True,
+)
+
+st.caption(
+    f"Loaded at most the most recent {MAX_ROWS_TO_LOAD:,} rows from SQLite: "
+    f"{DB_PATH}."
 )

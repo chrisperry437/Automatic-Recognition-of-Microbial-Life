@@ -1,17 +1,5 @@
 """
 Prediction storage utilities for the real-time Rapid-E pipeline.
-
-Supports:
-    - CSV storage for simple thesis demos
-    - SQLite storage for dashboard/API use
-    - batch-level summaries
-    - label composition summaries
-
-Typical outputs:
-    results/realtime/predictions.csv
-    results/realtime/file_summary.csv
-    results/realtime/label_summary.csv
-    results/realtime/predictions.sqlite
 """
 
 from __future__ import annotations
@@ -29,12 +17,11 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 StorageBackend = Literal["csv", "sqlite", "both"]
+MAX_SQLITE_PREDICTION_ROWS = 50_000
 
 
 @dataclass(frozen=True)
 class PredictionStoreConfig:
-    """Configuration for prediction storage."""
-
     output_dir: Path = Path("results/realtime")
     sqlite_path: Path | None = None
     backend: StorageBackend = "both"
@@ -46,18 +33,10 @@ class PredictionStoreConfig:
 
 
 def ensure_dir(path: Path) -> None:
-    """Create a directory if it does not already exist."""
     path.mkdir(parents=True, exist_ok=True)
 
 
 def make_json_safe(value: Any) -> Any:
-    """
-    Convert values to JSON/SQLite safe formats.
-
-    Arrays, lists, and dictionaries are serialized to JSON strings.
-    NumPy scalar values are converted to Python scalar values.
-    Timestamps are converted to ISO strings.
-    """
     if isinstance(value, np.generic):
         return value.item()
 
@@ -70,16 +49,16 @@ def make_json_safe(value: Any) -> Any:
     if isinstance(value, pd.Timestamp):
         return value.isoformat()
 
-    if pd.isna(value) if not isinstance(value, (list, tuple, dict, np.ndarray)) else False:
-        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
 
     return value
 
 
 def make_dataframe_storage_safe(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert dataframe values into CSV/SQLite-safe representations.
-    """
     if df.empty:
         return df.copy()
 
@@ -96,11 +75,7 @@ def append_or_write_csv(
     path: Path,
     append: bool = True,
 ) -> None:
-    """
-    Append dataframe to CSV if it exists, otherwise create it.
-    """
     ensure_dir(path.parent)
-
     safe_df = make_dataframe_storage_safe(df)
 
     if append and path.exists():
@@ -114,9 +89,6 @@ def summarize_file(
     source_file: str | None = None,
     batch_id: str | None = None,
 ) -> pd.DataFrame:
-    """
-    Create one-row summary for a processed file or batch.
-    """
     processed_at = pd.Timestamp.utcnow().isoformat()
 
     if predictions.empty:
@@ -137,12 +109,7 @@ def summarize_file(
             ]
         )
 
-    label_col = "predicted_label"
-    confidence_col = "prediction_confidence"
-
-    counts = predictions[label_col].value_counts(dropna=False)
-    top_label = str(counts.index[0])
-    top_count = int(counts.iloc[0])
+    counts = predictions["predicted_label"].value_counts(dropna=False)
     total = int(len(predictions))
 
     n_unknown = (
@@ -152,8 +119,8 @@ def summarize_file(
     )
 
     mean_confidence = (
-        float(predictions[confidence_col].mean())
-        if confidence_col in predictions.columns
+        float(predictions["prediction_confidence"].mean())
+        if "prediction_confidence" in predictions.columns
         else None
     )
 
@@ -169,9 +136,9 @@ def summarize_file(
                 if n_unknown is not None and total
                 else None,
                 "mean_confidence": mean_confidence,
-                "top_label": top_label,
-                "top_label_count": top_count,
-                "top_label_proportion": top_count / total if total else 0.0,
+                "top_label": str(counts.index[0]),
+                "top_label_count": int(counts.iloc[0]),
+                "top_label_proportion": int(counts.iloc[0]) / total,
             }
         ]
     )
@@ -182,9 +149,6 @@ def summarize_labels(
     source_file: str | None = None,
     batch_id: str | None = None,
 ) -> pd.DataFrame:
-    """
-    Create label-level count and proportion summary.
-    """
     processed_at = pd.Timestamp.utcnow().isoformat()
 
     if predictions.empty or "predicted_label" not in predictions.columns:
@@ -202,16 +166,22 @@ def summarize_labels(
 
     total = len(predictions)
 
-    summary = (
-        predictions.groupby("predicted_label", dropna=False)
-        .agg(
-            count=("predicted_label", "size"),
-            mean_confidence=("prediction_confidence", "mean")
-            if "prediction_confidence" in predictions.columns
-            else ("predicted_label", "size"),
+    if "prediction_confidence" in predictions.columns:
+        summary = (
+            predictions.groupby("predicted_label", dropna=False)
+            .agg(
+                count=("predicted_label", "size"),
+                mean_confidence=("prediction_confidence", "mean"),
+            )
+            .reset_index()
         )
-        .reset_index()
-    )
+    else:
+        summary = (
+            predictions.groupby("predicted_label", dropna=False)
+            .agg(count=("predicted_label", "size"))
+            .reset_index()
+        )
+        summary["mean_confidence"] = None
 
     summary["proportion"] = summary["count"] / total
     summary["batch_id"] = batch_id
@@ -232,10 +202,6 @@ def summarize_labels(
 
 
 class PredictionStore:
-    """
-    Store live predictions to CSV, SQLite, or both.
-    """
-
     def __init__(self, config: PredictionStoreConfig | None = None) -> None:
         self.config = config or PredictionStoreConfig()
         ensure_dir(self.config.output_dir)
@@ -250,60 +216,118 @@ class PredictionStore:
             self.initialize_sqlite()
 
     def connect(self) -> sqlite3.Connection:
-        """Open SQLite connection."""
         ensure_dir(self.sqlite_path.parent)
         return sqlite3.connect(self.sqlite_path)
 
     def initialize_sqlite(self) -> None:
         """
-        Initialize SQLite database.
+        Initialize SQLite file only.
 
-        Tables are created automatically by pandas.to_sql, but this verifies the
-        database path exists and can be opened.
+        Tables are created dynamically by pandas.to_sql so the schema matches
+        the prediction dataframe produced by the current model/parser.
         """
         with self.connect() as conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.commit()
 
-        logger.info("SQLite prediction store initialized at %s", self.sqlite_path)
+    def save_predictions_csv(self, predictions: pd.DataFrame) -> None:
+        append_or_write_csv(
+            predictions,
+            self.config.output_dir / self.config.predictions_csv,
+            append=self.config.append_csv,
+        )
 
-    def save_predictions_csv(
+    def save_file_summary_csv(self, file_summary: pd.DataFrame) -> None:
+        append_or_write_csv(
+            file_summary,
+            self.config.output_dir / self.config.file_summary_csv,
+            append=self.config.append_csv,
+        )
+
+    def save_label_summary_csv(self, label_summary: pd.DataFrame) -> None:
+        append_or_write_csv(
+            label_summary,
+            self.config.output_dir / self.config.label_summary_csv,
+            append=self.config.append_csv,
+        )
+
+    def table_exists(self, conn: sqlite3.Connection, table_name: str) -> bool:
+        result = conn.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type='table' AND name=?
+            """,
+            (table_name,),
+        ).fetchone()
+        return result is not None
+
+    def add_missing_columns(
         self,
-        predictions: pd.DataFrame,
+        conn: sqlite3.Connection,
+        df: pd.DataFrame,
+        table_name: str,
     ) -> None:
-        """Save particle-level predictions to CSV."""
-        path = self.config.output_dir / self.config.predictions_csv
-        append_or_write_csv(predictions, path, append=self.config.append_csv)
+        existing_cols = {
+            row[1]
+            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
 
-    def save_file_summary_csv(
-        self,
-        file_summary: pd.DataFrame,
-    ) -> None:
-        """Save file/batch-level summary to CSV."""
-        path = self.config.output_dir / self.config.file_summary_csv
-        append_or_write_csv(file_summary, path, append=self.config.append_csv)
+        for col in df.columns:
+            if col not in existing_cols:
+                conn.execute(f'ALTER TABLE "{table_name}" ADD COLUMN "{col}" TEXT')
 
-    def save_label_summary_csv(
+    def create_indexes_if_possible(
         self,
-        label_summary: pd.DataFrame,
+        conn: sqlite3.Connection,
+        table_name: str,
     ) -> None:
-        """Save label-level summary to CSV."""
-        path = self.config.output_dir / self.config.label_summary_csv
-        append_or_write_csv(label_summary, path, append=self.config.append_csv)
+        if table_name != "predictions":
+            return
+
+        cols = {
+            row[1]
+            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+
+        index_candidates = {
+            "timestamp": "idx_predictions_timestamp",
+            "raw_file": "idx_predictions_raw_file",
+            "predicted_label": "idx_predictions_label",
+            "stored_at": "idx_predictions_stored_at",
+            "source_file": "idx_predictions_source_file",
+            "batch_id": "idx_predictions_batch_id",
+        }
+
+        for col, index_name in index_candidates.items():
+            if col in cols:
+                conn.execute(
+                    f'CREATE INDEX IF NOT EXISTS "{index_name}" '
+                    f'ON "{table_name}" ("{col}")'
+                )
 
     def save_dataframe_sqlite(
         self,
         df: pd.DataFrame,
         table_name: str,
     ) -> None:
-        """Append dataframe to SQLite table."""
         if df.empty:
             return
 
         safe_df = make_dataframe_storage_safe(df)
 
         with self.connect() as conn:
-            safe_df.to_sql(table_name, conn, if_exists="append", index=False)
+            if self.table_exists(conn, table_name):
+                self.add_missing_columns(conn, safe_df, table_name)
+
+            safe_df.to_sql(
+                table_name,
+                conn,
+                if_exists="append",
+                index=False,
+            )
+
+            self.create_indexes_if_possible(conn, table_name)
+            conn.commit()
 
     def save_batch(
         self,
@@ -311,29 +335,11 @@ class PredictionStore:
         source_file: str | None = None,
         batch_id: str | None = None,
     ) -> dict[str, pd.DataFrame]:
-        """
-        Save one batch of predictions.
-
-        Parameters
-        ----------
-        predictions:
-            Particle-level prediction dataframe.
-        source_file:
-            Optional source file name.
-        batch_id:
-            Optional batch identifier.
-
-        Returns
-        -------
-        dict[str, pd.DataFrame]
-            Saved dataframes:
-                - predictions
-                - file_summary
-                - label_summary
-        """
         predictions = predictions.copy()
-
         processed_at = pd.Timestamp.utcnow().isoformat()
+
+        if "model_name" not in predictions.columns:
+            predictions["model_name"] = None
 
         if "batch_id" not in predictions.columns:
             predictions["batch_id"] = batch_id
@@ -365,6 +371,7 @@ class PredictionStore:
             self.save_dataframe_sqlite(predictions, "predictions")
             self.save_dataframe_sqlite(file_summary, "file_summary")
             self.save_dataframe_sqlite(label_summary, "label_summary")
+            self.prune_sqlite_predictions()
 
         logger.info(
             "Stored prediction batch: batch_id=%s source_file=%s n=%d",
@@ -380,8 +387,11 @@ class PredictionStore:
         }
 
     def read_predictions(self, limit: int | None = 1000) -> pd.DataFrame:
-        """Read recent predictions from SQLite."""
-        query = "SELECT * FROM predictions"
+        query = """
+        SELECT *
+        FROM predictions
+        ORDER BY stored_at DESC
+        """
 
         if limit is not None:
             query += f" LIMIT {int(limit)}"
@@ -390,7 +400,6 @@ class PredictionStore:
             return pd.read_sql_query(query, conn)
 
     def read_file_summary(self, limit: int | None = 1000) -> pd.DataFrame:
-        """Read recent file summaries from SQLite."""
         query = "SELECT * FROM file_summary"
 
         if limit is not None:
@@ -400,7 +409,6 @@ class PredictionStore:
             return pd.read_sql_query(query, conn)
 
     def read_label_summary(self, limit: int | None = 1000) -> pd.DataFrame:
-        """Read recent label summaries from SQLite."""
         query = "SELECT * FROM label_summary"
 
         if limit is not None:
@@ -409,12 +417,30 @@ class PredictionStore:
         with self.connect() as conn:
             return pd.read_sql_query(query, conn)
 
+    def prune_sqlite_predictions(self) -> None:
+        with self.connect() as conn:
+            if not self.table_exists(conn, "predictions"):
+                return
+
+            conn.execute(
+                """
+                DELETE FROM predictions
+                WHERE rowid NOT IN (
+                    SELECT rowid
+                    FROM predictions
+                    ORDER BY rowid DESC
+                    LIMIT ?
+                )
+                """,
+                (MAX_SQLITE_PREDICTION_ROWS,),
+            )
+            conn.commit()
+
 
 def create_prediction_store(
     output_dir: str | Path = "results/realtime",
-    backend: StorageBackend = "both",
+    backend: StorageBackend = "sqlite",
 ) -> PredictionStore:
-    """Convenience factory for creating a prediction store."""
     return PredictionStore(
         PredictionStoreConfig(
             output_dir=Path(output_dir),

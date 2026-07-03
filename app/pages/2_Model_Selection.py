@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 
 import pandas as pd
@@ -8,6 +9,7 @@ import streamlit as st
 
 MODELS_DIR = Path("models/trained")
 CONFIG_PATH = Path("configs/active_model.json")
+DB_PATH = Path("./results/realtime/predictions.sqlite")
 
 st.set_page_config(
     page_title="Model Selection",
@@ -15,6 +17,7 @@ st.set_page_config(
     layout="wide",
 )
 
+st.divider()
 st.title("🧠 Model Selection")
 
 
@@ -31,6 +34,38 @@ def save_active_model(model_name: str) -> None:
 
     with CONFIG_PATH.open("w", encoding="utf-8") as f:
         json.dump({"active_model": model_name}, f, indent=2)
+
+
+@st.cache_data(ttl=2)
+def load_recent_predictions_from_db(
+    db_path: Path,
+    limit: int = 1000,
+) -> pd.DataFrame:
+    if not db_path.exists():
+        return pd.DataFrame()
+
+    query = """
+        SELECT *
+        FROM predictions
+        ORDER BY rowid DESC
+        LIMIT ?
+    """
+
+    with sqlite3.connect(db_path) as conn:
+        df = pd.read_sql_query(query, conn, params=(limit,))
+
+    df = df.iloc[::-1].reset_index(drop=True)
+
+    for col in ["processed_at", "event_time", "timestamp", "stored_at"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    return df
+
+
+if not MODELS_DIR.exists():
+    st.warning(f"Models directory not found: {MODELS_DIR}")
+    st.stop()
 
 
 model_files = sorted(
@@ -64,8 +99,57 @@ if st.button("Set active model", key="set_active_model_button"):
     save_active_model(selected_model)
     st.success(f"Active model updated to: {selected_model}")
 
+active_model = load_active_model()
+
 st.subheader("Current Active Model")
-st.code(load_active_model() or "No active model selected")
+st.code(active_model or "No active model selected")
+
+
+st.divider()
+
+st.subheader("Live Prediction Summary From SQLite")
+
+recent_df = load_recent_predictions_from_db(DB_PATH, limit=1000)
+
+if recent_df.empty:
+    st.info(f"No recent predictions found in SQLite database: {DB_PATH}")
+else:
+    latest = recent_df.iloc[-1]
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric("Recent rows loaded", f"{len(recent_df):,}")
+    col2.metric("Latest prediction", latest.get("predicted_label", "N/A"))
+
+    if "prediction_confidence" in recent_df.columns:
+        col3.metric(
+            "Mean confidence",
+            f"{recent_df['prediction_confidence'].mean():.1%}",
+        )
+    else:
+        col3.metric("Mean confidence", "N/A")
+
+    if "timestamp" in recent_df.columns:
+        latest_time = recent_df["timestamp"].dropna().max()
+        col4.metric("Latest timestamp", str(latest_time))
+    else:
+        col4.metric("Latest timestamp", "N/A")
+
+    if "predicted_label" in recent_df.columns:
+        live_counts = recent_df["predicted_label"].value_counts().reset_index()
+        live_counts.columns = ["predicted_label", "count"]
+
+        fig = px.bar(
+            live_counts,
+            x="predicted_label",
+            y="count",
+            title="Recent prediction distribution from SQLite",
+        )
+
+        fig.update_xaxes(title="Predicted species")
+        fig.update_yaxes(title="Particle count")
+
+        st.plotly_chart(fig, use_container_width=True)
 
 
 st.divider()
@@ -166,3 +250,5 @@ for path in available_models:
 
         with st.expander(f"Metadata: {path.name}"):
             st.json(metadata)
+
+st.caption(f"Live prediction summary is loaded from SQLite: {DB_PATH}")
